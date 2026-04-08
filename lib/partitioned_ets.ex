@@ -3,10 +3,11 @@ defmodule PartitionedEts do
   Distributed, partitioned ETS table for Elixir.
 
   `PartitionedEts` exposes the same API surface as `:ets`, but routes each
-  operation to the cluster node responsible for the key — and on each
-  node, to one of `N` local ETS tables sharded by `:erlang.phash2/2`. The
-  canonical API is module-shaped: every function takes the table name as
-  its first argument, mirroring `:ets` exactly.
+  operation to a single shard chosen by [rendezvous hashing
+  (HRW)](https://en.wikipedia.org/wiki/Rendezvous_hashing) over the
+  cluster's `(node, partition)` shard space. The canonical API is
+  module-shaped: every function takes the table name as its first
+  argument, mirroring `:ets` exactly.
 
       children = [
         {PartitionedEts,
@@ -23,15 +24,36 @@ defmodule PartitionedEts do
   back the logical table on each node. With `partitions: 1`, the single
   ETS table is named `name` itself; with `partitions: N > 1`, the
   partition tables are named `:"\#{name}_p0"` through
-  `:"\#{name}_p\#{N - 1}"`. Routing within a node is done by
-  `:erlang.phash2(key, N)` and goes directly to the chosen partition's
-  ETS table — no GenServer hop on the read or write path.
+  `:"\#{name}_p\#{N - 1}"`. Routing goes directly to the chosen
+  partition's ETS table — no GenServer hop on the read or write path.
 
   Splitting one logical table across multiple ETS tables on a single
   node reduces write contention (each ETS table has its own write
-  lock). On a multi-node cluster, the same `:partitions` setting must
-  be used on every node hosting the table — heterogeneous partition
+  lock). All nodes hosting the same logical table must currently use
+  the same `:partitions` value — heterogeneous per-node partition
   counts arrive in a later phase.
+
+  ## Routing
+
+  Routing is done by HRW: a key is mapped to one shard out of the
+  cluster-wide `(node, partition_table)` set. HRW has the property
+  that adding or removing a shard only remaps `~1/total` of keys —
+  most keys keep the same shard. This is the foundation for the
+  rebalancing work in a later phase.
+
+  > #### Phase 4 limitation: no data movement on membership changes {: .warning}
+  >
+  > **`PartitionedEts` does not yet move data between shards when
+  > nodes join or leave the cluster.** When the shard set changes,
+  > HRW remaps `~1/N` of keys to new shards, and any data that was
+  > written to the old owner is no longer reachable through the new
+  > routing — it stays on the old owner's ETS table until that node
+  > terminates, but lookups go elsewhere. **Treat the table as cache
+  > semantics for now**: data on a leaving node is lost; data hashed
+  > to a new node returns empty until you re-write it. The next phase
+  > of the project introduces handoff that physically transfers
+  > entries between shards on membership change, lifting this
+  > restriction.
 
   ## `use` macro
 
@@ -56,7 +78,16 @@ defmodule PartitionedEts do
 
   alias PartitionedEts.Registry
 
-  @callback hash(term(), [Node.t()]) :: Node.t()
+  @typedoc """
+  Cluster-wide identity of a partition: `{node, partition_table_atom}`.
+
+  The partition_table_atom is the same on every node hosting the table
+  (e.g. `:"my_table_p3"` for `name: :my_table, partitions: 4`); the
+  `node` field is what makes shards unique cluster-wide.
+  """
+  @type shard :: {Node.t(), atom()}
+
+  @callback hash(term(), [shard()]) :: shard()
   @callback node_added(Node.t()) :: any()
   @callback node_removed(Node.t()) :: any()
   @optional_callbacks hash: 2, node_added: 1, node_removed: 1
@@ -233,17 +264,23 @@ defmodule PartitionedEts do
   # ── Default hash ─────────────────────────────────────────────────────
 
   @doc """
-  Default cluster-level hash function: `:erlang.phash2(key, length(nodes))`
-  mapped onto the sorted node list. Picks which node owns the key.
+  Default routing function: rendezvous hashing (HRW) over the cluster's
+  shard set.
+
+  For each shard `s`, computes `:erlang.phash2({key, s})` and returns
+  the shard with the highest weight. Adding or removing a shard only
+  remaps the keys whose previously-highest weight came from the
+  changed shard — roughly `1/length(shards)` of all keys.
 
   Override by passing a `:callbacks` module to `start_link/1` that
   exports `hash/2`, or by defining `hash/2` on a `use PartitionedEts`
-  module.
+  module. The override receives the cluster shard list (sorted, so
+  every node sees the same input) and must return one of those
+  shards.
   """
-  @spec hash(term(), [Node.t()]) :: Node.t()
-  def hash(key, nodes) do
-    index = :erlang.phash2(key, length(nodes))
-    Enum.at(nodes, index)
+  @spec hash(term(), [shard()]) :: shard()
+  def hash(key, shards) do
+    Enum.max_by(shards, fn shard -> :erlang.phash2({key, shard}) end)
   end
 
   # ── ETS-shaped API ───────────────────────────────────────────────────
@@ -326,22 +363,20 @@ defmodule PartitionedEts do
 
   @spec next(atom(), term()) :: term() | :"$end_of_table"
   def next(table, key) do
-    {key_node, _} = key_node_with_list(table, key)
-    pt = local_partition_table(table, key)
+    {key_node, pt} = shard = key_shard(table, key)
 
     case shard_call(key_node, :next, [pt, key]) do
-      :"$end_of_table" -> find_shards(shards_after(table, :forward, {key_node, pt}), :first)
+      :"$end_of_table" -> find_shards(shards_after(table, :forward, shard), :first)
       value -> value
     end
   end
 
   @spec prev(atom(), term()) :: term() | :"$end_of_table"
   def prev(table, key) do
-    {key_node, _} = key_node_with_list(table, key)
-    pt = local_partition_table(table, key)
+    {key_node, pt} = shard = key_shard(table, key)
 
     case shard_call(key_node, :prev, [pt, key]) do
-      :"$end_of_table" -> find_shards(shards_after(table, :reverse, {key_node, pt}), :last)
+      :"$end_of_table" -> find_shards(shards_after(table, :reverse, shard), :last)
       value -> value
     end
   end
@@ -415,9 +450,8 @@ defmodule PartitionedEts do
   # node manage its own partition count independently.
 
   @doc false
-  def __remote_dispatch__(table, key, fun, args) do
-    pt = local_partition_table(table, key)
-    apply(:ets, fun, [pt | tl(args)])
+  def __remote_dispatch__(partition_table, fun, args) do
+    apply(:ets, fun, [partition_table | tl(args)])
   end
 
   @doc false
@@ -431,20 +465,13 @@ defmodule PartitionedEts do
     :persistent_term.get({__MODULE__, table, :config})
   end
 
-  defp local_partition_table(table, key) do
-    cfg = config(table)
-    partition_id = :erlang.phash2(key, cfg.partition_count)
-    elem(cfg.partition_tables, partition_id)
-  end
-
   defp partitioned_call(table, key, fun, args) do
-    {key_node, _nodes} = key_node_with_list(table, key)
+    {key_node, partition_table} = key_shard(table, key)
 
     if key_node == node() do
-      pt = local_partition_table(table, key)
-      apply(:ets, fun, [pt | tl(args)])
+      apply(:ets, fun, [partition_table | tl(args)])
     else
-      :erpc.call(key_node, __MODULE__, :__remote_dispatch__, [table, key, fun, args])
+      :erpc.call(key_node, __MODULE__, :__remote_dispatch__, [partition_table, fun, args])
     end
   end
 
@@ -487,10 +514,10 @@ defmodule PartitionedEts do
     end
   end
 
-  defp key_node_with_list(table, key) do
-    nodes = fetch_nodes(table)
+  defp key_shard(table, key) do
     cfg = config(table)
-    {cfg.hash.hash(key, nodes), nodes}
+    shards = shards(table, :forward)
+    cfg.hash.hash(key, shards)
   end
 
   defp fetch_nodes(table) do

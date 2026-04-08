@@ -19,9 +19,9 @@ defmodule PartitionedEtsTest do
     use PartitionedEts, table_opts: [:named_table, :public]
 
     @after_compile {Cluster, :inject}
-    def hash(key, nodes) do
+    def hash(key, shards) do
       send(self(), :hash_function_overloaded)
-      super(key, nodes)
+      super(key, shards)
     end
 
     @spec sample_fold_fn() :: (term(), list() -> String.t())

@@ -183,9 +183,10 @@ defmodule PartitionedEts.ModuleTest do
   describe "callbacks module" do
     defmodule HashCallbacks do
       @moduledoc false
-      def hash(key, nodes) do
+      def hash(key, shards) do
         send(:cb_test, {:hashed, key})
-        key |> :erlang.phash2(length(nodes)) |> then(&Enum.at(nodes, &1))
+        # Defer to the default HRW implementation.
+        PartitionedEts.hash(key, shards)
       end
     end
 
