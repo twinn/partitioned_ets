@@ -34,5 +34,8 @@ jobs:
       - run: mix deps.get
       - run: mix format --check-formatted
       - run: mix compile --warnings-as-errors
+      # The :peer-based test cluster needs epmd running so spawned nodes
+      # can register over the inet_tcp protocol.
+      - run: epmd -daemon
       - run: mix ci
       - run: mix dialyzer
