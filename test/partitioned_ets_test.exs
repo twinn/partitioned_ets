@@ -1,28 +1,10 @@
 defmodule PartitionedEtsTest do
   @moduledoc """
-  Tests for `PartitionedEts`.
+  Tests for the `use PartitionedEts` macro form, exercised across a
+  two-node `:peer` cluster.
 
-  ## Validation behaviours not yet covered by tests
-
-  The following validations are implemented today inside the
-  `PartitionedEts` `use` macro but lack test coverage. They were
-  previously asserted via `Table.new(:bad_opts, [...])` calls that no
-  longer match the macro-only API. They will be re-introduced as
-  runtime checks (and tested as such) in the Phase 2 cleanup, when the
-  macro-only API is replaced with module-based `PartitionedEts.new/2`.
-
-    * `:named_table` is required — without it, `start_link/1` raises
-      "Elixir.PartitionedEts only supports `:named_table`, include it in
-      your list of options".
-    * `:public` is required — without it, `start_link/1` raises
-      "Elixir.PartitionedEts only supports `:public`, include it in your
-      list of options".
-    * `:private` and `:protected` are rejected — including either raises
-      "Elixir.PartitionedEts does not support `:private` it only supports
-      `:public`, include it in your list of options" (or `:protected`).
-    * `keypos:` must be `1` — any other value raises
-      "Elixir.PartitionedEts only supports `keypos: 1`, include it in
-      your list of options".
+  Validation rules and the module-form API are tested in
+  `test/partitioned_ets/module_test.exs`.
   """
 
   use ExUnit.Case
@@ -33,9 +15,8 @@ defmodule PartitionedEtsTest do
 
   defmodule Table do
     @moduledoc false
-    @behaviour PartitionedEts
 
-    use PartitionedEts, [:named_table, :public]
+    use PartitionedEts, table_opts: [:named_table, :public]
 
     @after_compile {Cluster, :inject}
     def hash(key, nodes) do

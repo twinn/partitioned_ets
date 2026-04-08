@@ -28,10 +28,10 @@ defmodule PartitionedEts.Cluster do
       export_module(node, service)
     end)
 
-    args = [
-      [PartitionedEts.Registry | services],
-      [strategy: :one_for_one]
-    ]
+    # PartitionedEts.Application has already been started on the remote
+    # node by ensure_applications_started/1, so the :pg scope is up.
+    # We just supervise the user's table modules here.
+    args = [services, [strategy: :one_for_one]]
 
     rpc(node, Supervisor, :start_link, args)
   end
@@ -87,13 +87,11 @@ defmodule PartitionedEts.Cluster do
   defp export_module(node, module) do
     case :persistent_term.get(module, false) do
       binary when is_binary(binary) ->
-        filename =
-          ~c"./Elixir.PartitionedEts.Example.beam"
-
+        filename = ~c"./Elixir.PartitionedEts.Example.beam"
         :rpc.call(node, :code, :load_binary, [module, filename, binary])
 
       _ ->
-        IO.puts("skipping #{module}")
+        :ok
     end
   end
 
