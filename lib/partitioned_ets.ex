@@ -3,26 +3,45 @@ defmodule PartitionedEts do
   Distributed, partitioned ETS table for Elixir.
 
   `PartitionedEts` exposes the same API surface as `:ets`, but routes each
-  operation to the cluster node responsible for the key. The canonical API
-  is module-shaped — every function takes the table name as its first
-  argument, mirroring `:ets` exactly:
+  operation to the cluster node responsible for the key — and on each
+  node, to one of `N` local ETS tables sharded by `:erlang.phash2/2`. The
+  canonical API is module-shaped: every function takes the table name as
+  its first argument, mirroring `:ets` exactly.
 
       children = [
-        {PartitionedEts, name: :my_cache, table_opts: [:named_table, :public]}
+        {PartitionedEts,
+         name: :my_cache, table_opts: [:named_table, :public], partitions: 16}
       ]
 
       PartitionedEts.insert(:my_cache, {:key, :value})
       PartitionedEts.lookup(:my_cache, :key)
       #=> [{:key, :value}]
 
+  ## Partitions
+
+  The `:partitions` option (default `1`) controls how many ETS tables
+  back the logical table on each node. With `partitions: 1`, the single
+  ETS table is named `name` itself; with `partitions: N > 1`, the
+  partition tables are named `:"\#{name}_p0"` through
+  `:"\#{name}_p\#{N - 1}"`. Routing within a node is done by
+  `:erlang.phash2(key, N)` and goes directly to the chosen partition's
+  ETS table — no GenServer hop on the read or write path.
+
+  Splitting one logical table across multiple ETS tables on a single
+  node reduces write contention (each ETS table has its own write
+  lock). On a multi-node cluster, the same `:partitions` setting must
+  be used on every node hosting the table — heterogeneous partition
+  counts arrive in a later phase.
+
   ## `use` macro
 
-  An optional `use PartitionedEts, table_opts: [...]` macro generates a
-  one-module-per-table wrapper for users who prefer that style. The
-  generated functions delegate to the canonical module API:
+  An optional `use PartitionedEts, table_opts: [...], partitions: N`
+  macro generates a one-module-per-table wrapper for users who prefer
+  that style. The generated functions delegate to the canonical module
+  API:
 
       defmodule MyApp.Cache do
-        use PartitionedEts, table_opts: [:named_table, :public]
+        use PartitionedEts, table_opts: [:named_table, :public], partitions: 16
       end
 
       MyApp.Cache.insert({:key, :value})
@@ -44,8 +63,9 @@ defmodule PartitionedEts do
 
   @typedoc """
   Opaque continuation token returned from `match/3`, `select/3`, and the
-  other paginated ETS functions. Cluster-aware: encodes which node the
-  scan should resume on as well as the underlying `:ets` continuation.
+  other paginated ETS functions. Cluster-aware: encodes which shard
+  ((node, partition) pair) the scan should resume on as well as the
+  underlying `:ets` continuation, if any.
 
   `:ets` declares its own `continuation/0` as `typep` (private), so we
   carry our own opaque alias instead of referring to it from outside the
@@ -53,7 +73,7 @@ defmodule PartitionedEts do
   """
   @opaque continuation :: tuple()
 
-  defstruct [:name, :table_ref, :callbacks, :monitor_ref]
+  defstruct [:name, :callbacks, :monitor_ref]
 
   defguardp is_continuation(value) when is_tuple(value) and elem(value, 0) == :continue
 
@@ -63,7 +83,7 @@ defmodule PartitionedEts do
   Returns a child specification suitable for use in a supervision tree.
 
   Required keys: `:name` (atom), `:table_opts` (list).
-  Optional: `:callbacks` (module).
+  Optional: `:partitions` (positive integer, default 1), `:callbacks` (module).
   """
   def child_spec(opts) do
     name = Keyword.fetch!(opts, :name)
@@ -82,24 +102,31 @@ defmodule PartitionedEts do
 
   ## Options
 
-    * `:name` — atom, required. Used as the ETS table name, the `:pg`
-      group key, and the `:via` registration name.
+    * `:name` — atom, required. Used as the ETS table name (when
+      `:partitions` is 1) or as the prefix for the partition table
+      names (when greater), the `:pg` group key, and the `:via`
+      registration name.
     * `:table_opts` — list, required. Passed to `:ets.new/2`. Must
       include `:named_table` and `:public`.
-    * `:callbacks` — module, optional. May export `hash/2`, `node_added/1`,
-      `node_removed/1`. Each is optional individually; defaults are used
-      for any not exported.
+    * `:partitions` — positive integer, optional, default `1`. Number
+      of ETS tables to create on this node. Routing within the node is
+      done by `:erlang.phash2(key, partitions)`.
+    * `:callbacks` — module, optional. May export `hash/2`,
+      `node_added/1`, `node_removed/1`. Each is optional individually;
+      defaults are used for any not exported.
   """
   def start_link(opts) do
     name = Keyword.fetch!(opts, :name)
     table_opts = opts |> Keyword.fetch!(:table_opts) |> List.wrap()
+    partitions = Keyword.get(opts, :partitions, 1)
     callbacks = Keyword.get(opts, :callbacks)
 
     validate_table_opts!(table_opts)
+    validate_partitions!(partitions)
 
     GenServer.start_link(
       __MODULE__,
-      {name, table_opts, callbacks},
+      {name, table_opts, partitions, callbacks},
       name: {:via, Registry, name}
     )
   end
@@ -125,11 +152,21 @@ defmodule PartitionedEts do
     end
   end
 
+  defp validate_partitions!(n) when is_integer(n) and n > 0, do: :ok
+
+  defp validate_partitions!(n) do
+    raise ArgumentError, "#{inspect(__MODULE__)} :partitions must be a positive integer, got: #{inspect(n)}"
+  end
+
   # ── GenServer callbacks ──────────────────────────────────────────────
 
   @impl GenServer
-  def init({name, table_opts, callbacks}) do
-    table_ref = :ets.new(name, table_opts)
+  def init({name, table_opts, partitions, callbacks}) do
+    partition_tables = build_partition_tables(name, partitions)
+
+    Enum.each(partition_tables, fn pt ->
+      :ets.new(pt, table_opts)
+    end)
 
     if callbacks, do: Code.ensure_loaded(callbacks)
 
@@ -138,7 +175,13 @@ defmodule PartitionedEts do
         do: callbacks,
         else: __MODULE__
 
-    :persistent_term.put({__MODULE__, name, :hash}, hash_module)
+    config = %{
+      partition_count: partitions,
+      partition_tables: List.to_tuple(partition_tables),
+      hash: hash_module
+    }
+
+    :persistent_term.put({__MODULE__, name, :config}, config)
 
     # Monitor only this table's group; raw :pg.monitor avoids the
     # cluster-wide event fan-out from monitor_scope/1.
@@ -147,15 +190,20 @@ defmodule PartitionedEts do
     {:ok,
      %__MODULE__{
        name: name,
-       table_ref: table_ref,
        callbacks: callbacks,
        monitor_ref: monitor_ref
      }}
   end
 
+  defp build_partition_tables(name, 1), do: [name]
+
+  defp build_partition_tables(name, n) do
+    for i <- 0..(n - 1), do: :"#{name}_p#{i}"
+  end
+
   @impl GenServer
   def terminate(_reason, %{name: name}) do
-    :persistent_term.erase({__MODULE__, name, :hash})
+    :persistent_term.erase({__MODULE__, name, :config})
     :ok
   end
 
@@ -185,8 +233,8 @@ defmodule PartitionedEts do
   # ── Default hash ─────────────────────────────────────────────────────
 
   @doc """
-  Default hash function: `:erlang.phash2(key, length(nodes))` mapped onto
-  the sorted node list.
+  Default cluster-level hash function: `:erlang.phash2(key, length(nodes))`
+  mapped onto the sorted node list. Picks which node owns the key.
 
   Override by passing a `:callbacks` module to `start_link/1` that
   exports `hash/2`, or by defining `hash/2` on a `use PartitionedEts`
@@ -239,7 +287,7 @@ defmodule PartitionedEts do
   @spec match(atom(), :ets.match_pattern() | continuation()) ::
           [term()] | {[term()], continuation()} | :"$end_of_table"
   def match(table, continuation) when is_continuation(continuation) do
-    handle_continuation(table, continuation, :match)
+    resume_paginated(table, continuation)
   end
 
   def match(table, spec), do: all_call(table, :match, [table, spec])
@@ -247,13 +295,13 @@ defmodule PartitionedEts do
   @spec match(atom(), :ets.match_pattern(), pos_integer()) ::
           {[term()], continuation()} | :"$end_of_table"
   def match(table, spec, limit) do
-    handle_continuation(table, {:continue, nil, limit, [table, spec, limit]}, :match)
+    start_paginated(table, :match, spec, limit, :forward)
   end
 
   @spec select(atom(), :ets.match_spec() | continuation()) ::
           [term()] | {[term()], continuation()} | :"$end_of_table"
   def select(table, continuation) when is_continuation(continuation) do
-    handle_continuation(table, continuation, :select)
+    resume_paginated(table, continuation)
   end
 
   def select(table, spec), do: all_call(table, :select, [table, spec])
@@ -261,7 +309,7 @@ defmodule PartitionedEts do
   @spec select(atom(), :ets.match_spec(), pos_integer()) ::
           {[term()], continuation()} | :"$end_of_table"
   def select(table, spec, limit) do
-    handle_continuation(table, {:continue, nil, limit, [table, spec, limit]}, :select)
+    start_paginated(table, :select, spec, limit, :forward)
   end
 
   @spec select_count(atom(), :ets.match_spec()) :: non_neg_integer()
@@ -271,63 +319,38 @@ defmodule PartitionedEts do
   def tab2list(table), do: all_call(table, :tab2list, [table])
 
   @spec first(atom()) :: term() | :"$end_of_table"
-  def first(table) do
-    table
-    |> fetch_nodes()
-    |> find(:first, [table])
-  end
+  def first(table), do: find_shards(shards(table, :forward), :first)
 
   @spec last(atom()) :: term() | :"$end_of_table"
-  def last(table) do
-    table
-    |> fetch_nodes(:reverse)
-    |> find(:last, [table])
-  end
+  def last(table), do: find_shards(shards(table, :reverse), :last)
 
   @spec next(atom(), term()) :: term() | :"$end_of_table"
   def next(table, key) do
-    {key_node, nodes} = key_node_with_list(table, key)
+    {key_node, _} = key_node_with_list(table, key)
+    pt = local_partition_table(table, key)
 
-    case :erpc.call(key_node, :ets, :next, [table, key]) do
-      :"$end_of_table" ->
-        nodes
-        |> remaining_nodes(key_node)
-        |> find(:first, [table])
-
-      value ->
-        value
+    case shard_call(key_node, :next, [pt, key]) do
+      :"$end_of_table" -> find_shards(shards_after(table, :forward, {key_node, pt}), :first)
+      value -> value
     end
   end
 
   @spec prev(atom(), term()) :: term() | :"$end_of_table"
   def prev(table, key) do
-    {key_node, nodes} = key_node_with_list(table, key)
+    {key_node, _} = key_node_with_list(table, key)
+    pt = local_partition_table(table, key)
 
-    case :erpc.call(key_node, :ets, :prev, [table, key]) do
-      :"$end_of_table" ->
-        nodes
-        |> Enum.reverse()
-        |> remaining_nodes(key_node)
-        |> find(:last, [table])
-
-      value ->
-        value
+    case shard_call(key_node, :prev, [pt, key]) do
+      :"$end_of_table" -> find_shards(shards_after(table, :reverse, {key_node, pt}), :last)
+      value -> value
     end
   end
 
   @spec foldl(atom(), (term(), term() -> term()), term()) :: term()
-  def foldl(table, fun, acc) do
-    table
-    |> fetch_nodes()
-    |> fold(:foldl, fun, table, acc)
-  end
+  def foldl(table, fun, acc), do: fold_shards(shards(table, :forward), :foldl, fun, acc)
 
   @spec foldr(atom(), (term(), term() -> term()), term()) :: term()
-  def foldr(table, fun, acc) do
-    table
-    |> fetch_nodes(:reverse)
-    |> fold(:foldr, fun, table, acc)
-  end
+  def foldr(table, fun, acc), do: fold_shards(shards(table, :reverse), :foldr, fun, acc)
 
   @spec match_delete(atom(), :ets.match_pattern()) :: true
   def match_delete(table, spec), do: all_call(table, :match_delete, [table, spec])
@@ -335,7 +358,7 @@ defmodule PartitionedEts do
   @spec match_object(atom(), :ets.match_pattern() | continuation()) ::
           [tuple()] | {[tuple()], continuation()} | :"$end_of_table"
   def match_object(table, continuation) when is_continuation(continuation) do
-    handle_continuation(table, continuation, :match_object)
+    resume_paginated(table, continuation)
   end
 
   def match_object(table, spec), do: all_call(table, :match_object, [table, spec])
@@ -343,7 +366,7 @@ defmodule PartitionedEts do
   @spec match_object(atom(), :ets.match_pattern(), pos_integer()) ::
           {[tuple()], continuation()} | :"$end_of_table"
   def match_object(table, spec, limit) do
-    handle_continuation(table, {:continue, nil, limit, [table, spec, limit]}, :match_object)
+    start_paginated(table, :match_object, spec, limit, :forward)
   end
 
   @spec select_delete(atom(), :ets.match_spec()) :: non_neg_integer()
@@ -352,7 +375,7 @@ defmodule PartitionedEts do
   @spec select_reverse(atom(), :ets.match_spec() | continuation()) ::
           [term()] | {[term()], continuation()} | :"$end_of_table"
   def select_reverse(table, continuation) when is_continuation(continuation) do
-    handle_continuation(table, continuation, :select_reverse, :reverse)
+    resume_paginated(table, continuation)
   end
 
   def select_reverse(table, spec), do: all_call(table, :select_reverse, [table, spec], :reverse)
@@ -360,12 +383,7 @@ defmodule PartitionedEts do
   @spec select_reverse(atom(), :ets.match_spec(), pos_integer()) ::
           {[term()], continuation()} | :"$end_of_table"
   def select_reverse(table, spec, limit) do
-    handle_continuation(
-      table,
-      {:continue, nil, limit, [table, spec, limit]},
-      :select_reverse,
-      :reverse
-    )
+    start_paginated(table, :select_reverse, spec, limit, :reverse)
   end
 
   @spec update_counter(atom(), term(), term()) :: integer()
@@ -389,21 +407,176 @@ defmodule PartitionedEts do
   @spec select_replace(atom(), :ets.match_spec()) :: non_neg_integer()
   def select_replace(table, spec), do: all_call(table, :select_replace, [table, spec])
 
+  # ── Internal: remote-callable dispatchers ────────────────────────────
+  #
+  # These are public so :erpc.call can target them, but are not part of
+  # the user API. They run on the *target* node and resolve the local
+  # partition layout from that node's persistent_term, which lets each
+  # node manage its own partition count independently.
+
+  @doc false
+  def __remote_dispatch__(table, key, fun, args) do
+    pt = local_partition_table(table, key)
+    apply(:ets, fun, [pt | tl(args)])
+  end
+
+  @doc false
+  def __remote_fanout__(table, fun, args) do
+    local_fanout(table, fun, args)
+  end
+
   # ── Routing helpers ──────────────────────────────────────────────────
 
-  defp find(nodes, fun, args) do
-    Enum.reduce_while(nodes, :"$end_of_table", fn node, acc ->
-      case :erpc.call(node, :ets, fun, args) do
+  defp config(table) do
+    :persistent_term.get({__MODULE__, table, :config})
+  end
+
+  defp local_partition_table(table, key) do
+    cfg = config(table)
+    partition_id = :erlang.phash2(key, cfg.partition_count)
+    elem(cfg.partition_tables, partition_id)
+  end
+
+  defp partitioned_call(table, key, fun, args) do
+    {key_node, _nodes} = key_node_with_list(table, key)
+
+    if key_node == node() do
+      pt = local_partition_table(table, key)
+      apply(:ets, fun, [pt | tl(args)])
+    else
+      :erpc.call(key_node, __MODULE__, :__remote_dispatch__, [table, key, fun, args])
+    end
+  end
+
+  defp all_call(table, fun, args, direction \\ :forward) do
+    nodes = fetch_nodes(table, direction)
+
+    per_node_results =
+      Enum.map(nodes, fn node ->
+        if node == node() do
+          local_fanout(table, fun, args)
+        else
+          :erpc.call(node, __MODULE__, :__remote_fanout__, [table, fun, args])
+        end
+      end)
+
+    merge_results(per_node_results, table, fun)
+  end
+
+  defp local_fanout(table, fun, args) do
+    cfg = config(table)
+    partition_tables = Tuple.to_list(cfg.partition_tables)
+
+    results =
+      Enum.map(partition_tables, fn pt ->
+        apply(:ets, fun, [pt | tl(args)])
+      end)
+
+    merge_results(results, table, fun)
+  end
+
+  defp merge_results([], table, fun), do: raise("no shards available for #{inspect(fun)} on #{inspect(table)}")
+
+  defp merge_results([single], _table, _fun), do: single
+
+  defp merge_results(results, _table, _fun) do
+    cond do
+      Enum.all?(results, &is_list/1) -> Enum.concat(results)
+      Enum.all?(results, &is_integer/1) -> Enum.sum(results)
+      true -> hd(results)
+    end
+  end
+
+  defp key_node_with_list(table, key) do
+    nodes = fetch_nodes(table)
+    cfg = config(table)
+    {cfg.hash.hash(key, nodes), nodes}
+  end
+
+  defp fetch_nodes(table) do
+    # Exclude the local node when its named ETS tables no longer exist.
+    # There is a brief window between the local owner GenServer exiting
+    # (which destroys all of its named partition ETS tables) and `:pg`
+    # processing the resulting process EXIT and removing the dead pid
+    # from the group. During that window, `Registry.members/1` still
+    # returns the dead local pid, and routing to the local node would
+    # fail with `:badarg` because the named tables are gone.
+    local_node = node()
+    local_present? = local_present?(table)
+
+    table
+    |> Registry.members()
+    |> Enum.map(&:erlang.node/1)
+    |> Enum.uniq()
+    |> Enum.reject(fn n -> n == local_node and not local_present? end)
+    |> Enum.sort()
+  end
+
+  defp local_present?(table) do
+    case :persistent_term.get({__MODULE__, table, :config}, nil) do
+      nil ->
+        false
+
+      cfg ->
+        cfg.partition_tables
+        |> Tuple.to_list()
+        |> Enum.all?(&(:ets.whereis(&1) != :undefined))
+    end
+  end
+
+  defp fetch_nodes(tab, :reverse), do: tab |> fetch_nodes() |> Enum.reverse()
+  defp fetch_nodes(tab, :forward), do: fetch_nodes(tab)
+
+  # ── Shard iteration ──────────────────────────────────────────────────
+  #
+  # A "shard" is a {node, partition_table} pair. Iterating shards is
+  # what powers fan-out reads, paginated scans, find/fold, and
+  # next/prev. The shard order is nodes-major (sorted), partitions-
+  # minor (in their stored order). Phase 3 assumes a homogeneous
+  # partition layout across the cluster — each node has the same
+  # `:partitions` count and therefore the same partition table names.
+
+  defp shards(table, direction) do
+    nodes = fetch_nodes(table, direction)
+    pts = config(table).partition_tables |> Tuple.to_list() |> maybe_reverse(direction)
+
+    for n <- nodes, pt <- pts, do: {n, pt}
+  end
+
+  defp maybe_reverse(list, :forward), do: list
+  defp maybe_reverse(list, :reverse), do: Enum.reverse(list)
+
+  defp shards_after(table, direction, current_shard) do
+    table
+    |> shards(direction)
+    |> Enum.drop_while(&(&1 != current_shard))
+    |> case do
+      [] -> []
+      [_current | rest] -> rest
+    end
+  end
+
+  defp shard_call(node, fun, args) do
+    if node == node() do
+      apply(:ets, fun, args)
+    else
+      :erpc.call(node, :ets, fun, args)
+    end
+  end
+
+  defp find_shards(shards, fun) do
+    Enum.reduce_while(shards, :"$end_of_table", fn {node, pt}, acc ->
+      case shard_call(node, fun, [pt]) do
         :"$end_of_table" -> {:cont, acc}
         value -> {:halt, value}
       end
     end)
   end
 
-  defp fold(nodes, remote_fn, fun, tab, acc) do
-    Enum.reduce(nodes, acc, fn node, acc ->
+  defp fold_shards(shards, remote_fn, fun, acc) do
+    Enum.reduce(shards, acc, fn {node, pt}, acc ->
       try do
-        :erpc.call(node, :ets, remote_fn, [fun, acc, tab])
+        shard_call(node, remote_fn, [fun, acc, pt])
       rescue
         e in ErlangError ->
           # :erpc surfaces a remote `:undef` (e.g. an anonymous fn that
@@ -424,104 +597,77 @@ defmodule PartitionedEts do
     end)
   end
 
-  defp key_node_with_list(tab, key) do
-    nodes = fetch_nodes(tab)
-    hash_module = :persistent_term.get({__MODULE__, tab, :hash}, __MODULE__)
-    {hash_module.hash(key, nodes), nodes}
+  # ── Paginated scans (match/3, select/3, …) ───────────────────────────
+  #
+  # Phase 3 limitation: rather than streaming chunks via `:ets`
+  # continuations across nodes (which doesn't actually work — the
+  # internal magic refs in an `:ets` continuation point to compiled
+  # match-spec resources that are local to the originating VM and
+  # round-trip incorrectly via :erpc), we materialize the full result
+  # set on the first call by fanning out unbounded across all shards,
+  # then paginate the in-memory list.
+  #
+  # The continuation tuple shape is opaque to callers but holds:
+  #
+  #   {:continue, fun, spec, limit, leftover}
+  #
+  # where `leftover` is the unread tail of the materialized result
+  # list. This is wasteful for large tables — Phase 4/5 will introduce
+  # per-node scan-session processes that hold the `:ets` continuation
+  # locally and stream chunks back, sidestepping the cross-node refs
+  # problem.
+
+  defp start_paginated(table, fun, spec, limit, direction) do
+    full_args =
+      if direction == :reverse,
+        do: [table, spec],
+        else: [table, spec]
+
+    full_results = all_call(table, unbounded_fun(fun), full_args, direction)
+    paginate(full_results, fun, spec, limit)
   end
 
-  defp fetch_nodes(tab) do
-    # Exclude the local node when its ETS table no longer exists. There
-    # is a brief window between the local owner GenServer exiting (which
-    # destroys its named ETS table) and `:pg` processing the resulting
-    # process EXIT and removing the dead pid from the group. During that
-    # window, `Registry.members/1` still returns the dead local pid, and
-    # routing to the local node would fail with `:badarg` because the
-    # named table is gone.
-    local_node = node()
-    local_present? = :ets.whereis(tab) != :undefined
-
-    tab
-    |> Registry.members()
-    |> Enum.map(&:erlang.node/1)
-    |> Enum.uniq()
-    |> Enum.reject(fn n -> n == local_node and not local_present? end)
-    |> Enum.sort()
+  defp resume_paginated(_table, {:continue, fun, spec, limit, leftover}) do
+    paginate(leftover, fun, spec, limit)
   end
 
-  defp fetch_nodes(tab, :reverse), do: tab |> fetch_nodes() |> Enum.reverse()
-  defp fetch_nodes(tab, :forward), do: fetch_nodes(tab)
+  # The 3-arity (limited) ETS calls and the 2-arity (unbounded) ETS
+  # calls share the same name. We always invoke the 2-arity flavour for
+  # fan-out and paginate on the materialized list.
+  defp unbounded_fun(:match), do: :match
+  defp unbounded_fun(:select), do: :select
+  defp unbounded_fun(:match_object), do: :match_object
+  defp unbounded_fun(:select_reverse), do: :select_reverse
 
-  defp partitioned_call(tab, key, fun, args) do
-    {key_node, _nodes} = key_node_with_list(tab, key)
-    :erpc.call(key_node, :ets, fun, args)
-  end
+  defp paginate([], _fun, _spec, _limit), do: :"$end_of_table"
 
-  defp all_call(tab, fun, args, direction \\ :forward) do
-    nodes = fetch_nodes(tab, direction)
-    results = Enum.map(nodes, fn node -> :erpc.call(node, :ets, fun, args) end)
-
-    cond do
-      results == [] -> raise "no nodes available for #{inspect(fun)} on #{inspect(tab)}"
-      Enum.all?(results, &is_list/1) -> Enum.concat(results)
-      Enum.all?(results, &is_integer/1) -> Enum.sum(results)
-      true -> hd(results)
-    end
-  end
-
-  # The cross-node continuation merge logic is incomplete and known to
-  # have edge-case bugs (negative limits, accumulator never returned on
-  # the less-than-limit branch, ordering on reverse). It is scheduled
-  # for a full rewrite in Phase 3 alongside multi-partition support.
-  defp handle_continuation(tab, continuation, fun, direction \\ :forward) do
-    case continuation do
-      {:continue, _prev_node, 0, _args} ->
-        :"$end_of_table"
-
-      {:continue, prev_node, limit, args} ->
-        tab
-        |> fetch_nodes(direction)
-        |> remaining_nodes(prev_node)
-        |> Enum.reduce_while({limit, []}, fn node, {limit, acc} ->
-          handle_continuation_step(node, fun, args, limit, acc)
-        end)
-    end
-  end
-
-  defp handle_continuation_step(node, fun, args, limit, acc) do
-    case :erpc.call(node, :ets, fun, args) do
-      :"$end_of_table" ->
-        {:cont, {limit, acc}}
-
-      {results, :"$end_of_table"} when length(results) < limit ->
-        {:cont, {limit - length(results), results ++ acc}}
-
-      {results, continuation} ->
-        {:halt, {results ++ acc, {:continue, node, limit - length(results), [continuation]}}}
-    end
-  end
-
-  defp remaining_nodes(nodes, nil), do: nodes
-
-  defp remaining_nodes(nodes, node) do
-    index = Enum.find_index(nodes, &Kernel.==(&1, node)) + 1
-    nodes |> Enum.split(index) |> elem(1)
+  defp paginate(results, fun, spec, limit) do
+    {taken, rest} = Enum.split(results, limit)
+    # Always return a `{:continue, ...}` tuple even when `rest == []`
+    # so the caller can pass the continuation back through `match/2`,
+    # `select/2`, etc. without it being misinterpreted as a match spec.
+    # An empty leftover triggers the `paginate([], …)` clause on the
+    # next call and returns `:"$end_of_table"`.
+    {taken, {:continue, fun, spec, limit, rest}}
   end
 
   # ── `use` macro (sugar) ──────────────────────────────────────────────
 
   defmacro __using__(opts) do
     table_opts = Keyword.fetch!(opts, :table_opts)
+    partitions = Keyword.get(opts, :partitions, 1)
 
     quote location: :keep do
       @behaviour PartitionedEts
 
       @partitioned_ets_table_opts unquote(table_opts)
+      @partitioned_ets_partitions unquote(partitions)
 
       def child_spec(_opts) do
         PartitionedEts.child_spec(
           name: __MODULE__,
           table_opts: @partitioned_ets_table_opts,
+          partitions: @partitioned_ets_partitions,
           callbacks: __MODULE__
         )
       end
@@ -530,6 +676,7 @@ defmodule PartitionedEts do
         PartitionedEts.start_link(
           name: __MODULE__,
           table_opts: @partitioned_ets_table_opts,
+          partitions: @partitioned_ets_partitions,
           callbacks: __MODULE__
         )
       end
