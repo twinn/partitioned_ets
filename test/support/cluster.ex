@@ -99,7 +99,7 @@ defmodule PartitionedEts.Cluster do
 
   defp node_name(node_host) do
     node_host
-    |> to_string
+    |> to_string()
     |> String.split("@")
     |> Enum.at(0)
     |> String.to_atom()

@@ -1,20 +1,50 @@
 defmodule PartitionedEtsTest do
+  @moduledoc """
+  Tests for `PartitionedEts`.
+
+  ## Validation behaviours not yet covered by tests
+
+  The following validations are implemented today inside the
+  `PartitionedEts` `use` macro but lack test coverage. They were
+  previously asserted via `Table.new(:bad_opts, [...])` calls that no
+  longer match the macro-only API. They will be re-introduced as
+  runtime checks (and tested as such) in the Phase 2 cleanup, when the
+  macro-only API is replaced with module-based `PartitionedEts.new/2`.
+
+    * `:named_table` is required — without it, `start_link/1` raises
+      "Elixir.PartitionedEts only supports `:named_table`, include it in
+      your list of options".
+    * `:public` is required — without it, `start_link/1` raises
+      "Elixir.PartitionedEts only supports `:public`, include it in your
+      list of options".
+    * `:private` and `:protected` are rejected — including either raises
+      "Elixir.PartitionedEts does not support `:private` it only supports
+      `:public`, include it in your list of options" (or `:protected`).
+    * `keypos:` must be `1` — any other value raises
+      "Elixir.PartitionedEts only supports `keypos: 1`, include it in
+      your list of options".
+  """
+
   use ExUnit.Case
-  doctest PartitionedEts
+
   alias PartitionedEts.Cluster
 
+  doctest PartitionedEts
+
   defmodule Table do
-    @after_compile {Cluster, :inject}
+    @moduledoc false
+    @behaviour PartitionedEts
+
     use PartitionedEts, [:named_table, :public]
 
-    @behaviour PartitionedEts
+    @after_compile {Cluster, :inject}
     def hash(key, nodes) do
       send(self(), :hash_function_overloaded)
       super(key, nodes)
     end
 
     @spec sample_fold_fn() :: (term(), list() -> String.t())
-    def sample_fold_fn() do
+    def sample_fold_fn do
       fn val, acc -> Enum.join(["#{inspect(val)}", acc]) end
     end
 
@@ -34,8 +64,7 @@ defmodule PartitionedEtsTest do
   setup_all do
     Cluster.spawn([:"node1@127.0.0.1", :"node2@127.0.0.1"])
 
-    Node.list()
-    |> Enum.each(fn node ->
+    Enum.each(Node.list(), fn node ->
       Cluster.start(node, [Table])
     end)
 
@@ -277,38 +306,6 @@ defmodule PartitionedEtsTest do
     assert Table.insert({:key, :foo, :bar})
     assert [{@key, :foo, :bar}, {:key, :foo, :bar}] == Table.tab2list()
   end
-
-  # test "doesn't support some options" do
-  #   assert_raise(
-  #     RuntimeError,
-  #     "Elixir.PartitionedEts only supports `:named_table`, include it in your list of options",
-  #     fn -> Table.new(:bad_opts, []) end
-  #   )
-
-  #   assert_raise(
-  #     RuntimeError,
-  #     "Elixir.PartitionedEts does not support `:private` it only supports `:public`, include it in your list of options",
-  #     fn -> Table.new(:bad_opts, [:private, :named_table]) end
-  #   )
-
-  #   assert_raise(
-  #     RuntimeError,
-  #     "Elixir.PartitionedEts does not support `:protected` it only supports `:public`, include it in your list of options",
-  #     fn -> Table.new(:bad_opts, [:protected, :named_table]) end
-  #   )
-
-  #   assert_raise(
-  #     RuntimeError,
-  #     "Elixir.PartitionedEts only supports `:public`, include it in your list of options",
-  #     fn -> Table.new(:bad_opts, [:named_table]) end
-  #   )
-
-  #   assert_raise(
-  #     RuntimeError,
-  #     "Elixir.PartitionedEts only supports `keypos: 1`, include it in your list of options",
-  #     fn -> Table.new(:bad_opts, [:named_table, :public, {:keypos, 2}]) end
-  #   )
-  # end
 
   test "when adding a node node joined hook is called" do
     Process.register(self(), :test_pid)

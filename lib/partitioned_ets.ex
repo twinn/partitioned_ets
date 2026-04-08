@@ -4,16 +4,22 @@ defmodule PartitionedEts do
   """
   @callback hash(term(), [Node.t()]) :: Node.t()
   @callback node_added(Node.t()) :: any()
-  defmacro __using__(table_opts) do
-    quote do
-      alias PartitionedEts.Registry
 
+  # The `use` macro is intentionally large for now: it generates the full
+  # ETS API surface (insert, lookup, match, select, foldl, continuations,
+  # update_counter, take, etc.) on the using module. Phase 2 of the project
+  # replaces this with a thin `defdelegate` shim over module-based functions
+  # on `PartitionedEts`, at which point this quote block will collapse to a
+  # few dozen lines. Until then we silence Credo's LongQuoteBlocks check.
+  defmacro __using__(table_opts) do
+    # credo:disable-for-next-line Credo.Check.Refactor.LongQuoteBlocks
+    quote do
       use GenServer
 
+      alias PartitionedEts.Registry
+
       def start_link(_opts) do
-        opts =
-          unquote(table_opts)
-          |> List.wrap()
+        opts = List.wrap(unquote(table_opts))
 
         validate_supported_opts!(opts)
         GenServer.start_link(__MODULE__, opts, name: {:via, Registry, __MODULE__})
@@ -36,11 +42,11 @@ defmodule PartitionedEts do
             :ok
         end)
 
-        unless Enum.member?(opts, :named_table) do
+        if !Enum.member?(opts, :named_table) do
           raise "#{unquote(__MODULE__)} only supports `:named_table`, include it in your list of options"
         end
 
-        unless Enum.member?(opts, :public) do
+        if !Enum.member?(opts, :public) do
           raise "#{unquote(__MODULE__)} only supports `:public`, include it in your list of options"
         end
       end
@@ -90,7 +96,7 @@ defmodule PartitionedEts do
       end
 
       @spec delete_all_objects() :: true
-      def delete_all_objects() do
+      def delete_all_objects do
         all_call(__MODULE__, :delete_all_objects, [__MODULE__])
       end
 
@@ -137,19 +143,19 @@ defmodule PartitionedEts do
       end
 
       @spec tab2list() :: [term()]
-      def tab2list() do
+      def tab2list do
         all_call(__MODULE__, :tab2list, [__MODULE__])
       end
 
       @spec first() :: term() | :"$end_of_table"
-      def first() do
+      def first do
         __MODULE__
         |> fetch_nodes()
         |> find(:first, [__MODULE__])
       end
 
       @spec last() :: term() | :"$end_of_table"
-      def last() do
+      def last do
         __MODULE__
         |> fetch_nodes(:reverse)
         |> find(:last, [__MODULE__])
@@ -281,8 +287,7 @@ defmodule PartitionedEts do
       end
 
       defp find(nodes, fun, args) do
-        nodes
-        |> Enum.reduce_while(:"$end_of_table", fn node, acc ->
+        Enum.reduce_while(nodes, :"$end_of_table", fn node, acc ->
           case :rpc.call(node, :ets, fun, args) do
             :"$end_of_table" -> {:cont, acc}
             value -> {:halt, value}
@@ -291,8 +296,7 @@ defmodule PartitionedEts do
       end
 
       defp fold(nodes, remote_fn, fun, tab, acc) do
-        nodes
-        |> Enum.reduce(acc, fn node, acc ->
+        Enum.reduce(nodes, acc, fn node, acc ->
           case :rpc.call(node, :ets, remote_fn, [fun, acc, tab]) do
             {:badrpc, {:EXIT, {:undef, _}}} ->
               raise %UndefinedFunctionError{
@@ -324,7 +328,8 @@ defmodule PartitionedEts do
       end
 
       defp fetch_nodes(tab, :reverse) do
-        fetch_nodes(tab)
+        tab
+        |> fetch_nodes()
         |> Enum.reverse()
       end
 
@@ -352,11 +357,23 @@ defmodule PartitionedEts do
             result
 
           err ->
-            IO.inspect(err)
-            raise "TODO fix this"
+            # Surface the raw multicall shape before raising so the
+            # un-formatted result is visible in stdout in addition to
+            # the exception message. The exhaustive shape handling is
+            # tracked for the Phase 2 cleanup.
+            # credo:disable-for-next-line Credo.Check.Warning.IoInspect
+            IO.inspect(err, label: "PartitionedEts unexpected multicall result")
+            raise "unexpected multicall result from #{inspect(fun)}"
         end
       end
 
+      # The cross-node continuation merge logic is incomplete and known to
+      # have edge-case bugs (negative limits, accumulator never returned,
+      # ordering on reverse). It is scheduled for a full rewrite in Phase 3
+      # alongside multi-partition support, which is why we don't refactor
+      # the nesting cosmetically here — the inner case is going to move to
+      # a per-partition function shortly.
+      # credo:disable-for-next-line Credo.Check.Refactor.Nesting
       defp handle_continuation(continuation, fun, direction \\ :forward) do
         case continuation do
           {:continue, _prev_node, 0, _args} ->
@@ -368,20 +385,21 @@ defmodule PartitionedEts do
             all_nodes
             |> remaining_nodes(prev_node)
             |> Enum.reduce_while({limit, []}, fn node, {limit, acc} ->
-              node
-              |> :rpc.call(:ets, fun, args)
-              |> case do
-                :"$end_of_table" ->
-                  {:cont, {limit, acc}}
-
-                {results, :"$end_of_table"} when length(results) < limit ->
-                  {:cont, {limit - length(results), results ++ acc}}
-
-                {results, continuation} ->
-                  {:halt,
-                   {results ++ acc, {:continue, node, limit - length(results), [continuation]}}}
-              end
+              handle_continuation_step(node, fun, args, limit, acc)
             end)
+        end
+      end
+
+      defp handle_continuation_step(node, fun, args, limit, acc) do
+        case :rpc.call(node, :ets, fun, args) do
+          :"$end_of_table" ->
+            {:cont, {limit, acc}}
+
+          {results, :"$end_of_table"} when length(results) < limit ->
+            {:cont, {limit - length(results), results ++ acc}}
+
+          {results, continuation} ->
+            {:halt, {results ++ acc, {:continue, node, limit - length(results), [continuation]}}}
         end
       end
 

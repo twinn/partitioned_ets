@@ -1,4 +1,5 @@
 defmodule PartitionedEts.Registry do
+  @moduledoc false
   use GenServer
 
   def start_link(_opts) do
@@ -17,12 +18,8 @@ defmodule PartitionedEts.Registry do
 
   def handle_info({_ref, :join, table, pids}, state) do
     if function_exported?(table, :node_added, 1) do
-      node =
-        pids
-        |> hd()
-        |> :erlang.node()
-
-      apply(table, :node_added, [node])
+      node = pids |> hd() |> :erlang.node()
+      table.node_added(node)
     end
 
     {:noreply, state}
@@ -30,24 +27,25 @@ defmodule PartitionedEts.Registry do
 
   def handle_info({_ref, :leave, table, pids}, state) do
     if function_exported?(table, :node_removed, 1) do
-      node =
-        pids
-        |> hd()
-        |> :erlang.node()
-
-      apply(table, :node_removed, [node])
+      node = pids |> hd() |> :erlang.node()
+      table.node_removed(node)
     end
 
     {:noreply, state}
   end
 
+  # Catch-all for any :pg messages we don't yet handle. We intentionally
+  # surface these via IO.inspect so unknown event shapes are visible during
+  # development — silent dropping would hide protocol changes in :pg.
   def handle_info(msg, state) do
-    IO.inspect(msg)
+    # credo:disable-for-next-line Credo.Check.Warning.IoInspect
+    IO.inspect(msg, label: "PartitionedEts.Registry unhandled message")
     {:noreply, state}
   end
 
   def whereis_name(name) do
-    :pg.get_local_members(__MODULE__, name)
+    __MODULE__
+    |> :pg.get_local_members(name)
     |> case do
       [pid | _] -> pid
       _ -> :undefined
