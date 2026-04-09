@@ -41,19 +41,43 @@ defmodule PartitionedEts do
   most keys keep the same shard. This is the foundation for the
   rebalancing work in a later phase.
 
-  > #### Phase 4 limitation: no data movement on membership changes {: .warning}
+  ## Handoff
+
+  When the cluster membership changes, affected entries are physically
+  transferred so that data and routing stay in sync:
+
+    * **Join** — when a new node joins `:pg`, every existing node sees
+      the `:join` event and iterates its local entries, ships the keys
+      whose new HRW shard lives on the joiner, and deletes them
+      locally. Runs inline in the owner GenServer's `handle_info` so
+      the user `node_added/1` callback fires *after* handoff has
+      completed on that node.
+
+    * **Graceful leave** — when an owner GenServer shuts down with a
+      `:normal`/`:shutdown`/`{:shutdown, _}` reason, `terminate/2`
+      snapshots membership, leaves `:pg`, then ships every local entry
+      to the shard that owns it under the shard set excluding self.
+
+  > #### Known limitations {: .info}
   >
-  > **`PartitionedEts` does not yet move data between shards when
-  > nodes join or leave the cluster.** When the shard set changes,
-  > HRW remaps `~1/N` of keys to new shards, and any data that was
-  > written to the old owner is no longer reachable through the new
-  > routing — it stays on the old owner's ETS table until that node
-  > terminates, but lookups go elsewhere. **Treat the table as cache
-  > semantics for now**: data on a leaving node is lost; data hashed
-  > to a new node returns empty until you re-write it. The next phase
-  > of the project introduces handoff that physically transfers
-  > entries between shards on membership change, lifting this
-  > restriction.
+  >   * **Hard crashes lose data.** If a node crashes without running
+  >     `terminate/2`, the entries it owned are gone. Replication is
+  >     a separate feature and not implemented here.
+  >
+  >   * **Brief race windows during membership changes.** During a
+  >     join, writes arriving at the new node concurrent with handoff
+  >     may be overwritten by the shipped older value. During a leave,
+  >     the moment between `:pg.leave` and gossip propagating to
+  >     peers may briefly route writes to the leaving node. These are
+  >     the same race windows stagehand documents on its equivalent
+  >     leave path; closing them requires symmetric sync-blocking on
+  >     the destination, which is a future improvement.
+  >
+  >   * **Handoff blocks the owner GenServer.** The iterate-and-ship
+  >     work runs inline in `handle_info` (join) or `terminate`
+  >     (leave). For very large tables this can exceed the supervisor
+  >     shutdown timeout; bump `shutdown:` in the child spec if
+  >     needed.
 
   ## `use` macro
 
@@ -193,6 +217,12 @@ defmodule PartitionedEts do
 
   @impl GenServer
   def init({name, table_opts, partitions, callbacks}) do
+    # Trap exits so terminate/2 runs on graceful shutdown (e.g. from
+    # a supervisor sending a :shutdown signal). Without this, the
+    # process exits immediately on any EXIT signal and the leave
+    # handoff never fires.
+    Process.flag(:trap_exit, true)
+
     partition_tables = build_partition_tables(name, partitions)
 
     Enum.each(partition_tables, fn pt ->
@@ -233,18 +263,37 @@ defmodule PartitionedEts do
   end
 
   @impl GenServer
-  def terminate(_reason, %{name: name}) do
+  def terminate(reason, %{name: name} = state) do
+    if graceful_shutdown?(reason) do
+      do_leave_handoff(state)
+    end
+
     :persistent_term.erase({__MODULE__, name, :config})
     :ok
   end
 
+  defp graceful_shutdown?(:normal), do: true
+  defp graceful_shutdown?(:shutdown), do: true
+  defp graceful_shutdown?({:shutdown, _}), do: true
+  defp graceful_shutdown?(_), do: false
+
   @impl GenServer
   def handle_info({ref, :join, group, pids}, %{monitor_ref: ref, name: group, callbacks: callbacks} = state) do
+    joiner_node = pids |> hd() |> :erlang.node()
+
+    # Run join handoff first so the user-visible node_added callback
+    # only fires once data has been moved to the new node. We skip the
+    # handoff if the join we're seeing is our own (defensive — :pg.monitor
+    # delivers the initial members snapshot separately, but a future
+    # :pg change in OTP could conceivably surface us via a :join event).
+    if joiner_node != node() do
+      do_join_handoff(state, joiner_node)
+    end
+
     if callbacks && function_exported?(callbacks, :node_added, 1) do
-      node = pids |> hd() |> :erlang.node()
       # Run user callbacks asynchronously so a slow callback can't block
       # the GenServer from accepting routing-state queries.
-      Task.start(fn -> callbacks.node_added(node) end)
+      Task.start(fn -> callbacks.node_added(joiner_node) end)
     end
 
     {:noreply, state}
@@ -260,6 +309,130 @@ defmodule PartitionedEts do
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
+
+  # ── Handoff (Phase 5) ────────────────────────────────────────────────
+  #
+  # When the cluster membership changes, HRW remaps `~1/total_shards`
+  # of keys to different shards. Without handoff, those keys are still
+  # physically present on the old owner's ETS tables but unreachable
+  # via the new routing. Handoff physically moves the affected entries
+  # to their new owners so the data and the routing stay in sync.
+  #
+  # Both halves are best-effort and run inline in the GenServer:
+  #
+  #   - Join handoff fires from `handle_info({_, :join, ...})` on every
+  #     existing node when a new node joins. Each existing node iterates
+  #     its local partitions, finds keys whose new HRW shard now lives
+  #     on the joiner, and ships them via `:erpc.call`.
+  #
+  #   - Leave handoff fires from `terminate/2` on the *graceful* exit
+  #     paths only (`:normal`, `:shutdown`, `{:shutdown, _}`). It leaves
+  #     `:pg` first so other nodes start to route around us, then ships
+  #     every local entry to its new owner under the shard set excluding
+  #     ourselves.
+  #
+  # Limitations (acknowledged, to be lifted later):
+  #
+  #   - Hard crashes (the leaving VM dies before terminate runs) still
+  #     lose the data on the crashed node. Replication is a separate
+  #     feature and not implemented.
+  #
+  #   - There is a brief race window during a join where the joining
+  #     node sees writes from other nodes for keys we are still in the
+  #     middle of shipping. The "ours" version may overwrite the
+  #     "theirs" version. Symmetric sync-blocking on the destination
+  #     would close this window and is a Phase 6+ improvement.
+  #
+  #   - There is a brief race window during a leave between calling
+  #     `:pg.leave` and the gossip propagating to other nodes; remote
+  #     writes that hash to us during that window land on a table that
+  #     is about to be destroyed. Stagehand has the same window and
+  #     documents it the same way.
+
+  defp do_join_handoff(%{name: name}, joiner_node) do
+    cfg = :persistent_term.get({__MODULE__, name, :config})
+    current_shards = shards(name, :forward)
+    partition_tables = Tuple.to_list(cfg.partition_tables)
+
+    Enum.each(partition_tables, fn local_pt ->
+      handoff_partition_to_joiner(local_pt, joiner_node, current_shards, cfg.hash)
+    end)
+  end
+
+  defp handoff_partition_to_joiner(local_pt, joiner_node, current_shards, hash_module) do
+    to_move =
+      :ets.foldl(
+        &collect_if_owned_by(&1, &2, joiner_node, current_shards, hash_module),
+        [],
+        local_pt
+      )
+
+    Enum.each(to_move, fn {key, obj, target_pt} ->
+      case ship_entry(joiner_node, target_pt, obj) do
+        :ok -> :ets.delete(local_pt, key)
+        {:error, _} -> :ok
+      end
+    end)
+  end
+
+  defp collect_if_owned_by(obj, acc, target_node, shards, hash_module) do
+    key = elem(obj, 0)
+    {owner_node, target_pt} = hash_module.hash(key, shards)
+
+    if owner_node == target_node do
+      [{key, obj, target_pt} | acc]
+    else
+      acc
+    end
+  end
+
+  defp do_leave_handoff(%{name: name}) do
+    current_node = node()
+    current_shards = shards(name, :forward)
+    new_shards = Enum.reject(current_shards, fn {n, _} -> n == current_node end)
+
+    if new_shards != [] do
+      drain_local_to(name, new_shards)
+    end
+
+    :ok
+  end
+
+  defp drain_local_to(name, new_shards) do
+    # Leave :pg before shipping so other nodes start routing around
+    # us. There is a brief window where the gossip hasn't propagated
+    # yet — accepted, see the comment above.
+    Registry.unregister_name(name)
+
+    cfg = :persistent_term.get({__MODULE__, name, :config})
+    hash_module = cfg.hash
+    partition_tables = Tuple.to_list(cfg.partition_tables)
+
+    Enum.each(partition_tables, fn local_pt ->
+      :ets.foldl(&ship_each(&1, &2, new_shards, hash_module), :ok, local_pt)
+    end)
+  end
+
+  defp ship_each(obj, _acc, shards, hash_module) do
+    key = elem(obj, 0)
+    {target_node, target_pt} = hash_module.hash(key, shards)
+    ship_entry(target_node, target_pt, obj)
+    :ok
+  end
+
+  defp ship_entry(target_node, target_table, obj) do
+    if target_node == node() do
+      :ets.insert(target_table, obj)
+      :ok
+    else
+      try do
+        :erpc.call(target_node, :ets, :insert, [target_table, obj])
+        :ok
+      rescue
+        e -> {:error, e}
+      end
+    end
+  end
 
   # ── Default hash ─────────────────────────────────────────────────────
 
