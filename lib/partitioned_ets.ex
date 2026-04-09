@@ -18,28 +18,65 @@ defmodule PartitionedEts do
       PartitionedEts.lookup(:my_cache, :key)
       #=> [{:key, :value}]
 
+  ## Architecture
+
+  A *shard* is a `{node, partition_table_atom}` pair. On each node
+  hosting the table, `start_link/1` creates `N` named ETS tables —
+  with `partitions: 1` (the default) the single ETS table is named
+  after the table itself; with `partitions: N > 1` they are named
+  `:"\#{name}_p0"` through `:"\#{name}_p\#{N - 1}"`. The cluster-wide
+  shard set is the cross product of all nodes × all partition tables.
+
+  The owner GenServer exists for **lifecycle only**: `init/1` creates
+  the partition tables, joins the `:pg` membership group, and writes
+  the shard configuration to `:persistent_term`; `terminate/2` runs
+  handoff on graceful shutdown and tears down `:persistent_term`.
+  **It does not serve reads or writes.** Operations in caller
+  processes read the shard configuration directly from
+  `:persistent_term` (lock-free), compute HRW over the shard set,
+  and call `:ets` either locally or via `:erpc` to the owning node.
+  The GenServer is off the hot path.
+
+  `:pg` (Erlang's process-group module) carries cluster membership.
+  Every owner GenServer calls `:pg.monitor/2` on its own group in
+  `init/1` so it can react to join/leave events with handoff; the
+  membership view itself is just `:pg.get_members/2`, read lock-free
+  from the calling process on every routing call.
+
   ## Partitions
 
   The `:partitions` option (default `1`) controls how many ETS tables
-  back the logical table on each node. With `partitions: 1`, the single
-  ETS table is named `name` itself; with `partitions: N > 1`, the
-  partition tables are named `:"\#{name}_p0"` through
-  `:"\#{name}_p\#{N - 1}"`. Routing goes directly to the chosen
-  partition's ETS table — no GenServer hop on the read or write path.
+  back the logical table on each node. Each partition is its own ETS
+  table with its own write lock, so splitting one logical table into
+  `N` partitions reduces write contention by roughly a factor of `N`
+  — the same reason Elixir's built-in `Registry` exposes a
+  `:partitions` option. For read-heavy workloads `partitions: 1` is
+  usually fine; for contended writes `System.schedulers_online()` is
+  a reasonable starting point.
 
-  Splitting one logical table across multiple ETS tables on a single
-  node reduces write contention (each ETS table has its own write
-  lock). All nodes hosting the same logical table must currently use
-  the same `:partitions` value — heterogeneous per-node partition
-  counts arrive in a later phase.
+  All nodes hosting the same logical table must currently use the
+  same `:partitions` value — heterogeneous per-node partition counts
+  are a future improvement.
 
   ## Routing
 
-  Routing is done by HRW: a key is mapped to one shard out of the
-  cluster-wide `(node, partition_table)` set. HRW has the property
-  that adding or removing a shard only remaps `~1/total` of keys —
-  most keys keep the same shard. This is the foundation for the
-  rebalancing work in a later phase.
+  Every key-based operation picks the single shard whose HRW weight
+  is highest:
+
+      hash(key, shards) =
+        Enum.max_by(shards, fn shard -> :erlang.phash2({key, shard}) end)
+
+  HRW has the property that **adding or removing one shard remaps
+  only `~1/total_shards` of keys**; all other keys keep the same
+  shard. This is the foundation of the handoff work: a single node
+  joining or leaving only requires moving a small slice of the data,
+  not the whole table. With modulo hashing (`phash2(key, N)`), by
+  contrast, adding one node would remap almost every key.
+
+  Override routing by passing a `:callbacks` module to `start_link/1`
+  that exports `hash/2`, or by defining `hash/2` on a `use
+  PartitionedEts` module. The override receives the full sorted
+  shard list and must return one of those shards.
 
   ## Handoff
 
@@ -78,6 +115,73 @@ defmodule PartitionedEts do
   >     (leave). For very large tables this can exceed the supervisor
   >     shutdown timeout; bump `shutdown:` in the child spec if
   >     needed.
+
+  ## Performance
+
+  Rough cost model for an `N`-node cluster with `P` partitions per
+  node (`total = N * P`):
+
+    * **Single-key ops** (`insert/2`, `lookup/2`, `delete/2`,
+      `update_counter/3`, `take/2`, …):
+      - 1× `:persistent_term.get` (lock-free, ~nanoseconds)
+      - `total` × `:erlang.phash2/2` for HRW (~microseconds)
+      - 1× direct `:ets` call if the owner is local (~nanoseconds)
+      - 1× `:erpc.call` if the owner is remote (~ milliseconds, network-bound)
+
+    * **Fan-out ops** (`match/2`, `select/2`, `tab2list/1`,
+      `select_count/2`, `delete_all_objects/1`, `foldl/3`, …):
+      - `N` × (one `:erpc.call` per remote node + `P` local `:ets`
+        calls on the receiver)
+      - Result merge is `Enum.concat` for lists, `Enum.sum` for
+        integers, or `hd/1` for scalar returns
+
+    * **Paginated ops** (`match/3`, `select/3`, `match_object/3`,
+      `select_reverse/3`):
+      - The first call materializes the *full* cluster-wide result
+        set in memory (via unbounded fan-out), then hands out
+        `limit`-sized chunks. Subsequent `match/2` (continuation)
+        calls just walk the in-memory tail.
+      - This is wasteful for large result sets; the right fix is
+        per-node scan-session processes that hold `:ets` continuations
+        locally and stream chunks over `:erpc`, which is on the
+        roadmap.
+
+  Fan-out ops are O(total cluster shards) per call. For BEAM clusters
+  in the 2–20 node range (the common case) this is fine; at hundreds
+  of nodes the fan-out semantics don't scale regardless of
+  implementation and the use case needs a different shape.
+
+  **Pagination** is in-memory for the reason noted above: `:ets`
+  continuations contain magic refs to compiled match-spec NIF
+  resources that are local to the originating VM and don't round-trip
+  cleanly via `:erpc`. Until the per-node scan-session process exists,
+  `match/3` and friends will materialize the full result set.
+
+  ## When to reach for this
+
+  **Good fit**:
+
+    * You have an `:ets` table that's growing past one node's comfort
+      zone and you want to spread it across a small BEAM cluster
+      (say, 2–20 nodes).
+    * You need the `:ets` API surface (match specs, pagination, foldl,
+      update_counter) — not just `get`/`put`.
+    * You want automatic rebalancing on graceful membership changes.
+    * You want multi-partition write-contention relief on each node
+      (even on a single-node deployment).
+    * Cache semantics for crashes are acceptable.
+
+  **Bad fit**:
+
+    * You need replication or survival across hard crashes. Use
+      Mnesia, Khepri, or a CP database.
+    * You need cluster-wide ordered iteration. Use a single-node
+      `:ordered_set` or a real database.
+    * Your result sets from `match`/`select` with a limit are large
+      enough that in-memory pagination is a dealbreaker. Wait for the
+      streaming-pagination improvement, or use a database.
+    * You're at hundreds of nodes. Fan-out doesn't scale; pick a
+      different shape (a proper distributed KV like Riak).
 
   ## `use` macro
 
@@ -137,8 +241,26 @@ defmodule PartitionedEts do
   @doc """
   Returns a child specification suitable for use in a supervision tree.
 
-  Required keys: `:name` (atom), `:table_opts` (list).
-  Optional: `:partitions` (positive integer, default 1), `:callbacks` (module).
+  The default spec uses `restart: :permanent` and `shutdown: 5_000`
+  (5 seconds). If your table is large enough that leave handoff could
+  exceed 5 seconds, override `shutdown:` in your own child spec.
+
+  ## Examples
+
+      # Via the tuple form (most common)
+      children = [
+        {PartitionedEts,
+         name: :my_cache, table_opts: [:named_table, :public]}
+      ]
+
+      # With a custom shutdown timeout for large tables
+      children = [
+        Supervisor.child_spec(
+          {PartitionedEts,
+           name: :my_cache, table_opts: [:named_table, :public]},
+          shutdown: 30_000
+        )
+      ]
   """
   def child_spec(opts) do
     name = Keyword.fetch!(opts, :name)
@@ -158,17 +280,51 @@ defmodule PartitionedEts do
   ## Options
 
     * `:name` — atom, required. Used as the ETS table name (when
-      `:partitions` is 1) or as the prefix for the partition table
+      `:partitions` is `1`) or as the prefix for the partition table
       names (when greater), the `:pg` group key, and the `:via`
-      registration name.
+      registration name. Must be unique per table per node.
+
     * `:table_opts` — list, required. Passed to `:ets.new/2`. Must
-      include `:named_table` and `:public`.
+      include both `:named_table` and `:public`; `:private` and
+      `:protected` are rejected (other processes need direct access
+      to the partition tables on the hot path), and `keypos` if
+      present must be `1`.
+
     * `:partitions` — positive integer, optional, default `1`. Number
-      of ETS tables to create on this node. Routing within the node is
-      done by `:erlang.phash2(key, partitions)`.
-    * `:callbacks` — module, optional. May export `hash/2`,
-      `node_added/1`, `node_removed/1`. Each is optional individually;
-      defaults are used for any not exported.
+      of ETS tables to create on this node. Splits write locks, so
+      higher values reduce contention on hot writes at the cost of
+      more per-call fan-out work. See the "Performance" section of
+      the module docs for the cost model.
+
+    * `:callbacks` — module, optional. May export any subset of
+      `hash/2`, `node_added/1`, `node_removed/1`. Defaults are used
+      for any function not exported. With the `use PartitionedEts`
+      macro form, the using module *is* the callbacks module and the
+      generated defaults are marked `defoverridable`.
+
+  ## Examples
+
+      # Simple module-form
+      PartitionedEts.start_link(
+        name: :my_cache,
+        table_opts: [:named_table, :public]
+      )
+
+      # With partitions for write-contention relief
+      PartitionedEts.start_link(
+        name: :my_cache,
+        table_opts: [:named_table, :public],
+        partitions: System.schedulers_online()
+      )
+
+      # In a supervision tree
+      children = [
+        {PartitionedEts,
+         name: :my_cache,
+         table_opts: [:named_table, :public],
+         partitions: 16}
+      ]
+
   """
   def start_link(opts) do
     name = Keyword.fetch!(opts, :name)
@@ -450,6 +606,21 @@ defmodule PartitionedEts do
   module. The override receives the cluster shard list (sorted, so
   every node sees the same input) and must return one of those
   shards.
+
+  ## Examples
+
+      iex> shards = [{:a, :t}, {:b, :t}, {:c, :t}]
+      iex> PartitionedEts.hash(:key, shards) in shards
+      true
+
+      iex> shards = [{:a, :t}, {:b, :t}, {:c, :t}]
+      iex> PartitionedEts.hash(:key, shards) == PartitionedEts.hash(:key, shards)
+      true
+
+      iex> shards = [{:a, :t}, {:b, :t}, {:c, :t}]
+      iex> shuffled = Enum.reverse(shards)
+      iex> PartitionedEts.hash(:key, shards) == PartitionedEts.hash(:key, shuffled)
+      true
   """
   @spec hash(term(), [shard()]) :: shard()
   def hash(key, shards) do
@@ -457,7 +628,22 @@ defmodule PartitionedEts do
   end
 
   # ── ETS-shaped API ───────────────────────────────────────────────────
+  #
+  # The functions below mirror the `:ets` API. Each takes the logical
+  # table name as its first argument and routes to the owning
+  # `{node, partition_table}` shard (for single-key ops) or fans out
+  # across every shard in the cluster (for multi-key ops). For the
+  # exact semantics of each operation see the corresponding `:ets`
+  # function; the only differences are listed in the per-function
+  # docstring (or the module-level "Performance" section).
 
+  @doc """
+  See `:ets.insert/2`.
+
+  Routes each object to the shard owning its key. A list argument
+  results in one `:erpc`/local ETS call per distinct target shard.
+  Always returns `true`.
+  """
   @spec insert(atom(), tuple() | [tuple()]) :: true
   def insert(table, objs) do
     for obj <- List.wrap(objs), is_tuple(obj) do
@@ -467,6 +653,7 @@ defmodule PartitionedEts do
     true
   end
 
+  @doc "See `:ets.lookup/2`. Single-shard call, routes via HRW."
   @spec lookup(atom(), term()) :: [tuple()]
   def lookup(table, key), do: partitioned_call(table, key, :lookup, [table, key])
 
@@ -494,6 +681,14 @@ defmodule PartitionedEts do
   @spec lookup_element(atom(), term(), pos_integer()) :: term() | [term()]
   def lookup_element(table, key, pos), do: partitioned_call(table, key, :lookup_element, [table, key, pos])
 
+  @doc """
+  See `:ets.match/2` and `:ets.match/1`.
+
+  When given a match pattern (`match/2`), fans out across every shard
+  in the cluster and concatenates results. When given a continuation
+  token from a previous call to `match/3`, resumes the in-memory
+  paginated walk.
+  """
   @spec match(atom(), :ets.match_pattern() | continuation()) ::
           [term()] | {[term()], continuation()} | :"$end_of_table"
   def match(table, continuation) when is_continuation(continuation) do
@@ -502,6 +697,17 @@ defmodule PartitionedEts do
 
   def match(table, spec), do: all_call(table, :match, [table, spec])
 
+  @doc """
+  See `:ets.match/3`.
+
+  Phase 3 simplification: this call materializes the *full*
+  cluster-wide result set in memory via an unbounded fan-out, then
+  returns the first `limit` entries along with an opaque continuation
+  that carries the remaining in-memory tail. Subsequent `match/2`
+  calls walk the tail. Wasteful for large result sets; see the
+  "Performance" section of the module docs for background and the
+  roadmap for the eventual streaming fix.
+  """
   @spec match(atom(), :ets.match_pattern(), pos_integer()) ::
           {[term()], continuation()} | :"$end_of_table"
   def match(table, spec, limit) do
@@ -528,12 +734,28 @@ defmodule PartitionedEts do
   @spec tab2list(atom()) :: [tuple()]
   def tab2list(table), do: all_call(table, :tab2list, [table])
 
+  @doc """
+  See `:ets.first/1`.
+
+  **Best-effort only**: returns the first non-empty key from iterating
+  shards in deterministic node-then-partition order, *not* the first
+  key by `:ordered_set` semantics. There is no global cluster-wide
+  order across shards. If you need true ordered iteration, use a
+  single-node `:ordered_set`.
+  """
   @spec first(atom()) :: term() | :"$end_of_table"
   def first(table), do: find_shards(shards(table, :forward), :first)
 
+  @doc """
+  See `:ets.last/1`. Best-effort, same caveats as `first/1`.
+  """
   @spec last(atom()) :: term() | :"$end_of_table"
   def last(table), do: find_shards(shards(table, :reverse), :last)
 
+  @doc """
+  See `:ets.next/2`. Best-effort, same caveats as `first/1` — walks
+  shards in a deterministic but not-globally-ordered sequence.
+  """
   @spec next(atom(), term()) :: term() | :"$end_of_table"
   def next(table, key) do
     {key_node, pt} = shard = key_shard(table, key)
@@ -544,6 +766,9 @@ defmodule PartitionedEts do
     end
   end
 
+  @doc """
+  See `:ets.prev/2`. Best-effort, same caveats as `first/1`.
+  """
   @spec prev(atom(), term()) :: term() | :"$end_of_table"
   def prev(table, key) do
     {key_node, pt} = shard = key_shard(table, key)
@@ -554,9 +779,22 @@ defmodule PartitionedEts do
     end
   end
 
+  @doc """
+  See `:ets.foldl/3`.
+
+  Folds across every shard in the cluster in deterministic
+  node-then-partition order. The fold function runs locally on each
+  shard's owning node via `:erpc`, so it must be available there
+  — typically via a `&Module.fun/2` reference (anonymous closures
+  only exist on the calling node and will raise `UndefinedFunctionError`
+  when reached on a remote shard).
+  """
   @spec foldl(atom(), (term(), term() -> term()), term()) :: term()
   def foldl(table, fun, acc), do: fold_shards(shards(table, :forward), :foldl, fun, acc)
 
+  @doc """
+  See `:ets.foldr/3`. Same remote-fn caveat as `foldl/3`.
+  """
   @spec foldr(atom(), (term(), term() -> term()), term()) :: term()
   def foldr(table, fun, acc), do: fold_shards(shards(table, :reverse), :foldr, fun, acc)
 
