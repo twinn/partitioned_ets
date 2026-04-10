@@ -105,10 +105,9 @@ defmodule PartitionedEts do
   >     join, writes arriving at the new node concurrent with handoff
   >     may be overwritten by the shipped older value. During a leave,
   >     the moment between `:pg.leave` and gossip propagating to
-  >     peers may briefly route writes to the leaving node. These are
-  >     the same race windows stagehand documents on its equivalent
-  >     leave path; closing them requires symmetric sync-blocking on
-  >     the destination, which is a future improvement.
+  >     peers may briefly route writes to the leaving node. Closing
+  >     these windows requires symmetric sync-blocking on the
+  >     destination, which is a future improvement.
   >
   >   * **Handoff blocks the owner GenServer.** The iterate-and-ship
   >     work runs inline in `handle_info` (join) or `terminate`
@@ -141,54 +140,52 @@ defmodule PartitionedEts do
         set in memory (via unbounded fan-out), then hands out
         `limit`-sized chunks. Subsequent `match/2` (continuation)
         calls just walk the in-memory tail.
-      - This is wasteful for large result sets; the right fix is
-        per-node scan-session processes that hold `:ets` continuations
-        locally and stream chunks over `:erpc`, which is on the
-        roadmap.
+      - This is wasteful for large result sets. A future improvement
+        will introduce per-node scan-session processes that hold `:ets`
+        continuations locally and stream chunks over `:erpc`.
 
   Fan-out ops are O(total cluster shards) per call. For BEAM clusters
   in the 2–20 node range (the common case) this is fine; at hundreds
-  of nodes the fan-out semantics don't scale regardless of
+  of nodes the fan-out semantics do not scale regardless of
   implementation and the use case needs a different shape.
 
   **Pagination** is in-memory for the reason noted above: `:ets`
   continuations contain magic refs to compiled match-spec NIF
-  resources that are local to the originating VM and don't round-trip
+  resources that are local to the originating VM and do not round-trip
   cleanly via `:erpc`. Until the per-node scan-session process exists,
   `match/3` and friends will materialize the full result set.
 
-  ## When to reach for this
+  ## When to use this library
 
-  **Good fit**:
+  **Good fit:**
 
-    * You have an `:ets` table that's growing past one node's comfort
-      zone and you want to spread it across a small BEAM cluster
-      (say, 2–20 nodes).
-    * You need the `:ets` API surface (match specs, pagination, foldl,
-      update_counter) — not just `get`/`put`.
-    * You want automatic rebalancing on graceful membership changes.
-    * You want multi-partition write-contention relief on each node
-      (even on a single-node deployment).
-    * Cache semantics for crashes are acceptable.
+    * An `:ets` table that needs to span a small BEAM cluster
+      (typically 2--20 nodes).
+    * The full `:ets` API surface is required (match specs, pagination,
+      `foldl/3`, `update_counter/3`), not only `get`/`put`.
+    * Automatic rebalancing on graceful membership changes is desired.
+    * Multi-partition write-contention relief on each node is needed
+      (including single-node deployments).
+    * Loss of data on hard crashes is acceptable (cache semantics).
 
-  **Bad fit**:
+  **Poor fit:**
 
-    * You need replication or survival across hard crashes. Use
+    * Replication or survival across hard crashes is required. Use
       Mnesia, Khepri, or a CP database.
-    * You need cluster-wide ordered iteration. Use a single-node
-      `:ordered_set` or a real database.
-    * Your result sets from `match`/`select` with a limit are large
-      enough that in-memory pagination is a dealbreaker. Wait for the
-      streaming-pagination improvement, or use a database.
-    * You're at hundreds of nodes. Fan-out doesn't scale; pick a
-      different shape (a proper distributed KV like Riak).
+    * Cluster-wide ordered iteration is needed. Use a single-node
+      `:ordered_set` or a database with ordering guarantees.
+    * Result sets from `match`/`select` with a limit are large enough
+      that in-memory pagination is not viable. A future streaming
+      pagination improvement will address this.
+    * The cluster has hundreds of nodes. Fan-out does not scale at
+      that size; a purpose-built distributed key-value store is more
+      appropriate.
 
   ## `use` macro
 
-  An optional `use PartitionedEts, table_opts: [...], partitions: N`
-  macro generates a one-module-per-table wrapper for users who prefer
-  that style. The generated functions delegate to the canonical module
-  API:
+  The `use PartitionedEts, table_opts: [...], partitions: N` macro
+  generates a one-module-per-table wrapper. The generated functions
+  delegate to the canonical module API:
 
       defmodule MyApp.Cache do
         use PartitionedEts, table_opts: [:named_table, :public], partitions: 16
@@ -657,6 +654,7 @@ defmodule PartitionedEts do
   @spec lookup(atom(), term()) :: [tuple()]
   def lookup(table, key), do: partitioned_call(table, key, :lookup, [table, key])
 
+  @doc "See `:ets.insert_new/2`. Routes each object to the shard owning its key."
   @spec insert_new(atom(), tuple() | [tuple()]) :: boolean()
   def insert_new(table, objects) when is_list(objects) do
     Enum.all?(objects, &insert_new(table, &1))
@@ -666,18 +664,23 @@ defmodule PartitionedEts do
     partitioned_call(table, elem(object, 0), :insert_new, [table, object])
   end
 
+  @doc "See `:ets.member/2`. Single-shard call, routes via HRW."
   @spec member(atom(), term()) :: boolean()
   def member(table, key), do: partitioned_call(table, key, :member, [table, key])
 
+  @doc "See `:ets.delete/2`. Single-shard call, routes via HRW."
   @spec delete(atom(), term()) :: true
   def delete(table, key), do: partitioned_call(table, key, :delete, [table, key])
 
+  @doc "See `:ets.delete_object/2`. Single-shard call, routes via HRW."
   @spec delete_object(atom(), tuple()) :: true
   def delete_object(table, obj), do: partitioned_call(table, elem(obj, 0), :delete_object, [table, obj])
 
+  @doc "See `:ets.delete_all_objects/1`. Fans out across every shard in the cluster."
   @spec delete_all_objects(atom()) :: true
   def delete_all_objects(table), do: all_call(table, :delete_all_objects, [table])
 
+  @doc "See `:ets.lookup_element/3`. Single-shard call, routes via HRW."
   @spec lookup_element(atom(), term(), pos_integer()) :: term() | [term()]
   def lookup_element(table, key, pos), do: partitioned_call(table, key, :lookup_element, [table, key, pos])
 
@@ -700,13 +703,12 @@ defmodule PartitionedEts do
   @doc """
   See `:ets.match/3`.
 
-  Phase 3 simplification: this call materializes the *full*
-  cluster-wide result set in memory via an unbounded fan-out, then
-  returns the first `limit` entries along with an opaque continuation
-  that carries the remaining in-memory tail. Subsequent `match/2`
-  calls walk the tail. Wasteful for large result sets; see the
-  "Performance" section of the module docs for background and the
-  roadmap for the eventual streaming fix.
+  Materializes the full cluster-wide result set in memory via an
+  unbounded fan-out, then returns the first `limit` entries along with
+  an opaque continuation carrying the remaining in-memory tail.
+  Subsequent `match/2` calls walk the tail. This approach is not
+  efficient for large result sets; see the "Performance" section of the
+  module documentation for details.
   """
   @spec match(atom(), :ets.match_pattern(), pos_integer()) ::
           {[term()], continuation()} | :"$end_of_table"
@@ -714,6 +716,13 @@ defmodule PartitionedEts do
     start_paginated(table, :match, spec, limit, :forward)
   end
 
+  @doc """
+  See `:ets.select/2` and `:ets.select/1`.
+
+  When given a match spec, fans out across every shard and concatenates
+  results. When given a continuation token from `select/3`, resumes the
+  in-memory paginated walk.
+  """
   @spec select(atom(), :ets.match_spec() | continuation()) ::
           [term()] | {[term()], continuation()} | :"$end_of_table"
   def select(table, continuation) when is_continuation(continuation) do
@@ -722,15 +731,18 @@ defmodule PartitionedEts do
 
   def select(table, spec), do: all_call(table, :select, [table, spec])
 
+  @doc "See `:ets.select/3`. Same in-memory pagination approach as `match/3`."
   @spec select(atom(), :ets.match_spec(), pos_integer()) ::
           {[term()], continuation()} | :"$end_of_table"
   def select(table, spec, limit) do
     start_paginated(table, :select, spec, limit, :forward)
   end
 
+  @doc "See `:ets.select_count/2`. Fans out across every shard and sums the counts."
   @spec select_count(atom(), :ets.match_spec()) :: non_neg_integer()
   def select_count(table, spec), do: all_call(table, :select_count, [table, spec])
 
+  @doc "See `:ets.tab2list/1`. Fans out across every shard and concatenates results."
   @spec tab2list(atom()) :: [tuple()]
   def tab2list(table), do: all_call(table, :tab2list, [table])
 
@@ -784,10 +796,10 @@ defmodule PartitionedEts do
 
   Folds across every shard in the cluster in deterministic
   node-then-partition order. The fold function runs locally on each
-  shard's owning node via `:erpc`, so it must be available there
-  — typically via a `&Module.fun/2` reference (anonymous closures
-  only exist on the calling node and will raise `UndefinedFunctionError`
-  when reached on a remote shard).
+  shard's owning node via `:erpc` and must therefore be available on
+  that node. Use a `&Module.fun/2` capture rather than an anonymous
+  function, as anonymous closures exist only on the calling node and
+  will raise `UndefinedFunctionError` on remote shards.
   """
   @spec foldl(atom(), (term(), term() -> term()), term()) :: term()
   def foldl(table, fun, acc), do: fold_shards(shards(table, :forward), :foldl, fun, acc)
@@ -798,9 +810,17 @@ defmodule PartitionedEts do
   @spec foldr(atom(), (term(), term() -> term()), term()) :: term()
   def foldr(table, fun, acc), do: fold_shards(shards(table, :reverse), :foldr, fun, acc)
 
+  @doc "See `:ets.match_delete/2`. Fans out across every shard in the cluster."
   @spec match_delete(atom(), :ets.match_pattern()) :: true
   def match_delete(table, spec), do: all_call(table, :match_delete, [table, spec])
 
+  @doc """
+  See `:ets.match_object/2` and `:ets.match_object/1`.
+
+  When given a match pattern, fans out across every shard and concatenates
+  results. When given a continuation token from `match_object/3`, resumes
+  the in-memory paginated walk.
+  """
   @spec match_object(atom(), :ets.match_pattern() | continuation()) ::
           [tuple()] | {[tuple()], continuation()} | :"$end_of_table"
   def match_object(table, continuation) when is_continuation(continuation) do
@@ -809,15 +829,24 @@ defmodule PartitionedEts do
 
   def match_object(table, spec), do: all_call(table, :match_object, [table, spec])
 
+  @doc "See `:ets.match_object/3`. Same in-memory pagination approach as `match/3`."
   @spec match_object(atom(), :ets.match_pattern(), pos_integer()) ::
           {[tuple()], continuation()} | :"$end_of_table"
   def match_object(table, spec, limit) do
     start_paginated(table, :match_object, spec, limit, :forward)
   end
 
+  @doc "See `:ets.select_delete/2`. Fans out across every shard and sums the counts."
   @spec select_delete(atom(), :ets.match_spec()) :: non_neg_integer()
   def select_delete(table, spec), do: all_call(table, :select_delete, [table, spec])
 
+  @doc """
+  See `:ets.select_reverse/2` and `:ets.select_reverse/1`.
+
+  When given a match spec, fans out across every shard (in reverse shard
+  order) and concatenates results. When given a continuation token from
+  `select_reverse/3`, resumes the in-memory paginated walk.
+  """
   @spec select_reverse(atom(), :ets.match_spec() | continuation()) ::
           [term()] | {[term()], continuation()} | :"$end_of_table"
   def select_reverse(table, continuation) when is_continuation(continuation) do
@@ -826,30 +855,36 @@ defmodule PartitionedEts do
 
   def select_reverse(table, spec), do: all_call(table, :select_reverse, [table, spec], :reverse)
 
+  @doc "See `:ets.select_reverse/3`. Same in-memory pagination approach as `match/3`."
   @spec select_reverse(atom(), :ets.match_spec(), pos_integer()) ::
           {[term()], continuation()} | :"$end_of_table"
   def select_reverse(table, spec, limit) do
     start_paginated(table, :select_reverse, spec, limit, :reverse)
   end
 
+  @doc "See `:ets.update_counter/3`. Single-shard call, routes via HRW."
   @spec update_counter(atom(), term(), term()) :: integer()
   def update_counter(table, key, update_op) do
     partitioned_call(table, key, :update_counter, [table, key, update_op])
   end
 
+  @doc "See `:ets.update_counter/4`. Single-shard call, routes via HRW."
   @spec update_counter(atom(), term(), term(), tuple()) :: integer()
   def update_counter(table, key, update_op, default) do
     partitioned_call(table, key, :update_counter, [table, key, update_op, default])
   end
 
+  @doc "See `:ets.update_element/3`. Single-shard call, routes via HRW."
   @spec update_element(atom(), term(), {pos_integer(), term()}) :: boolean()
   def update_element(table, key, update_op) do
     partitioned_call(table, key, :update_element, [table, key, update_op])
   end
 
+  @doc "See `:ets.take/2`. Single-shard call, routes via HRW."
   @spec take(atom(), term()) :: [tuple()]
   def take(table, key), do: partitioned_call(table, key, :take, [table, key])
 
+  @doc "See `:ets.select_replace/2`. Fans out across every shard in the cluster."
   @spec select_replace(atom(), :ets.match_spec()) :: non_neg_integer()
   def select_replace(table, spec), do: all_call(table, :select_replace, [table, spec])
 

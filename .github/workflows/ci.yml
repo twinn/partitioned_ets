@@ -7,13 +7,61 @@ on:
     branches: [main]
 
 jobs:
+  format:
+    name: Format
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.19"
+          otp-version: "28"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-mix-1.19-28-${{ hashFiles('mix.lock') }}
+          restore-keys: ${{ runner.os }}-mix-1.19-28-
+
+      - run: mix deps.get
+      - run: mix format --check-formatted
+
+  credo:
+    name: Credo
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.19"
+          otp-version: "28"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-mix-1.19-28-${{ hashFiles('mix.lock') }}
+          restore-keys: ${{ runner.os }}-mix-1.19-28-
+
+      - run: mix deps.get
+      - run: mix credo --strict
+
   test:
+    name: Test (Elixir ${{ matrix.elixir }} / OTP ${{ matrix.otp }})
     runs-on: ubuntu-latest
 
     strategy:
       matrix:
-        elixir: ["1.19"]
-        otp: ["28"]
+        include:
+          - elixir: "1.19"
+            otp: "28"
 
     steps:
       - uses: actions/checkout@v4
@@ -32,10 +80,35 @@ jobs:
           restore-keys: ${{ runner.os }}-mix-${{ matrix.elixir }}-${{ matrix.otp }}-
 
       - run: mix deps.get
-      - run: mix format --check-formatted
       - run: mix compile --warnings-as-errors
-      # The :peer-based test cluster needs epmd running so spawned nodes
-      # can register over the inet_tcp protocol.
       - run: epmd -daemon
-      - run: mix ci
+      - run: mix test
+
+  dialyzer:
+    name: Dialyzer
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.19"
+          otp-version: "28"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-mix-1.19-28-${{ hashFiles('mix.lock') }}
+          restore-keys: ${{ runner.os }}-mix-1.19-28-
+
+      - uses: actions/cache@v4
+        with:
+          path: priv/plts
+          key: ${{ runner.os }}-plt-1.19-28-${{ hashFiles('mix.lock') }}
+          restore-keys: ${{ runner.os }}-plt-1.19-28-
+
+      - run: mix deps.get
       - run: mix dialyzer
