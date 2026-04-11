@@ -101,13 +101,10 @@ defmodule PartitionedEts do
   >     `terminate/2`, the entries it owned are gone. Replication is
   >     a separate feature and not implemented here.
   >
-  >   * **Brief race windows during membership changes.** During a
-  >     join, writes arriving at the new node concurrent with handoff
-  >     may be overwritten by the shipped older value. During a leave,
-  >     the moment between `:pg.leave` and gossip propagating to
-  >     peers may briefly route writes to the leaving node. Closing
-  >     these windows requires symmetric sync-blocking on the
-  >     destination, which is a future improvement.
+  >   * **Brief race window during leave.** The moment between
+  >     `:pg.leave` and gossip propagating to peers may briefly route
+  >     writes to the leaving node. Join handoff uses `insert_new` to
+  >     avoid overwriting concurrent writes at the destination.
   >
   >   * **Handoff blocks the owner GenServer.** The iterate-and-ship
   >     work runs inline in `handle_info` (join) or `terminate`
@@ -490,11 +487,8 @@ defmodule PartitionedEts do
   #     lose the data on the crashed node. Replication is a separate
   #     feature and not implemented.
   #
-  #   - There is a brief race window during a join where the joining
-  #     node sees writes from other nodes for keys we are still in the
-  #     middle of shipping. The "ours" version may overwrite the
-  #     "theirs" version. Symmetric sync-blocking on the destination
-  #     would close this window and is a Phase 6+ improvement.
+  #   - Join handoff uses `insert_new` so shipped entries never
+  #     overwrite concurrent writes at the destination.
   #
   #   - There is a brief race window during a leave between calling
   #     `:pg.leave` and the gossip propagating to other nodes; remote
@@ -575,11 +569,11 @@ defmodule PartitionedEts do
 
   defp ship_entry(target_node, target_table, obj) do
     if target_node == node() do
-      :ets.insert(target_table, obj)
+      :ets.insert_new(target_table, obj)
       :ok
     else
       try do
-        :erpc.call(target_node, :ets, :insert, [target_table, obj])
+        :erpc.call(target_node, :ets, :insert_new, [target_table, obj])
         :ok
       rescue
         e -> {:error, e}
