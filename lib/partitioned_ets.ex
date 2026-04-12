@@ -1034,7 +1034,7 @@ defmodule PartitionedEts do
       try do
         apply(:ets, fun, [partition_table | tl(args)])
       rescue
-        e in ArgumentError ->
+        _e in ArgumentError ->
           reraise ArgumentError, "#{inspect(table)} is not running on this node", __STACKTRACE__
       end
     else
