@@ -25,28 +25,23 @@ defmodule PartitionedEts.Handoff do
   def conditional_insert(data_table, fp_table, obj) do
     key = elem(obj, 0)
 
+    if should_insert?(data_table, fp_table, key) do
+      :ets.insert(data_table, obj)
+      true
+    else
+      false
+    end
+  end
+
+  defp should_insert?(data_table, fp_table, key) do
     case :ets.lookup(fp_table, key) do
       [] ->
-        # No fingerprint — new entry that wasn't in pass 1.
-        :ets.insert(data_table, obj)
         true
 
       [{^key, fingerprint}] ->
         case :ets.lookup(data_table, key) do
-          [] ->
-            # Entry was deleted from destination — safe to insert.
-            :ets.insert(data_table, obj)
-            true
-
-          [current] ->
-            if :erlang.phash2(current) == fingerprint do
-              # Value hasn't changed since pass 1 — overwrite with our update.
-              :ets.insert(data_table, obj)
-              true
-            else
-              # A direct write changed the value — preserve it.
-              false
-            end
+          [] -> true
+          [current] -> :erlang.phash2(current) == fingerprint
         end
     end
   end

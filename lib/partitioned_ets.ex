@@ -633,7 +633,9 @@ defmodule PartitionedEts do
 
   defp record_fingerprint(target_node, fp_tables, obj) do
     case Map.get(fp_tables, target_node) do
-      nil -> :ok
+      nil ->
+        :ok
+
       fp_table ->
         key = elem(obj, 0)
         fp = :erlang.phash2(obj)
@@ -674,8 +676,7 @@ defmodule PartitionedEts do
       PartitionedEts.Handoff.conditional_insert(target_pt, fp_table, obj)
     else
       try do
-        :erpc.call(target_node, __MODULE__, :__remote_conditional_insert__,
-          [target_pt, fp_table, obj])
+        :erpc.call(target_node, __MODULE__, :__remote_conditional_insert__, [target_pt, fp_table, obj])
       rescue
         _ -> :ok
       end
@@ -1033,8 +1034,8 @@ defmodule PartitionedEts do
       try do
         apply(:ets, fun, [partition_table | tl(args)])
       rescue
-        ArgumentError ->
-          raise ArgumentError, "#{inspect(table)} is not running on this node"
+        e in ArgumentError ->
+          reraise ArgumentError, "#{inspect(table)} is not running on this node", __STACKTRACE__
       end
     else
       :erpc.call(key_node, __MODULE__, :__remote_dispatch__, [partition_table, fun, args])

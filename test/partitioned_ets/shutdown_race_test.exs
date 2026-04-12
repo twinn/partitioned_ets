@@ -12,6 +12,7 @@ defmodule PartitionedEts.ShutdownRaceTest do
   defmodule RaceTable do
     @moduledoc false
     use PartitionedEts, table_opts: [:named_table, :public]
+
     @after_compile {Cluster, :inject}
   end
 

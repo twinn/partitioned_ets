@@ -201,7 +201,8 @@ defmodule PartitionedEts.HandoffTest do
       writer =
         spawn(fn ->
           # Write in a loop until told to stop.
-          Stream.cycle(writer_keys)
+          writer_keys
+          |> Stream.cycle()
           |> Enum.reduce_while(0, fn key, n ->
             try do
               HandoffTable.insert({key, {:written, n}})
@@ -254,7 +255,7 @@ defmodule PartitionedEts.HandoffTest do
           HandoffTable.lookup(k) != []
         end)
 
-      assert length(found_writer_keys) > 0,
+      assert found_writer_keys != [],
              "none of the concurrent writes survived"
     after
       :peer.stop(peer_pid)
