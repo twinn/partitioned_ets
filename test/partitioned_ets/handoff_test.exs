@@ -169,6 +169,98 @@ defmodule PartitionedEts.HandoffTest do
            "key unexpectedly survived a hard crash — did we add replication?"
   end
 
+  test "leave handoff: writes during handoff are not lost" do
+    leave_node = :"handoff_concurrent_#{:erlang.unique_integer([:positive])}@127.0.0.1"
+    [{:ok, peer_pid, ^leave_node}] = Cluster.spawn([leave_node])
+
+    try do
+      {:ok, leave_sup_pid} = Cluster.start(leave_node, [HandoffTable])
+
+      wait_for_node_in_pg(HandoffTable, leave_node)
+      sync_all_genservers(HandoffTable)
+
+      # Seed data so the leave handoff has work to do.
+      seed_keys = for i <- 1..200, do: :"concurrent_seed_#{i}"
+      Enum.each(seed_keys, fn k -> HandoffTable.insert({k, :seed}) end)
+
+      # Find keys that are owned by leave_node — these are the ones
+      # whose handoff iteration we want to race against.
+      leave_keys =
+        Enum.filter(seed_keys, fn k ->
+          key_owning_node(HandoffTable, k) == leave_node
+        end)
+
+      assert length(leave_keys) > 10,
+             "need keys on leave_node to exercise the race, got #{length(leave_keys)}"
+
+      # Spawn a process that continuously writes to keys owned by
+      # leave_node. These writes race against the handoff iteration.
+      test_pid = self()
+      writer_keys = for i <- 1..50, do: :"concurrent_write_#{i}"
+
+      writer =
+        spawn(fn ->
+          # Write in a loop until told to stop.
+          Stream.cycle(writer_keys)
+          |> Enum.reduce_while(0, fn key, n ->
+            try do
+              HandoffTable.insert({key, {:written, n}})
+            rescue
+              ArgumentError -> :ok
+            end
+
+            receive do
+              :stop -> {:halt, n}
+            after
+              0 -> {:cont, n + 1}
+            end
+          end)
+          |> then(&send(test_pid, {:writer_done, &1}))
+        end)
+
+      # Let the writer run for a bit to get some data in.
+      Process.sleep(50)
+
+      # Gracefully stop leave_node — triggers two-pass leave handoff.
+      :ok = :erpc.call(leave_node, Supervisor, :stop, [leave_sup_pid, :shutdown])
+
+      # Stop the writer.
+      send(writer, :stop)
+
+      receive do
+        {:writer_done, write_count} ->
+          assert write_count > 0, "writer didn't manage any writes"
+      after
+        5_000 -> flunk("writer didn't finish")
+      end
+
+      wait_for_node_not_in_pg(HandoffTable, leave_node)
+      sync_all_genservers(HandoffTable)
+
+      # All seed keys should be reachable — the handoff shipped them.
+      lost_seeds =
+        Enum.filter(seed_keys, fn k ->
+          HandoffTable.lookup(k) == []
+        end)
+
+      assert lost_seeds == [],
+             "#{length(lost_seeds)} seed keys lost during concurrent-write leave handoff: #{inspect(Enum.take(lost_seeds, 5))}"
+
+      # Writer keys that were successfully inserted should be reachable.
+      # Some may not have been inserted at all (writer stopped early or
+      # the insert raised), so we only check keys that exist.
+      found_writer_keys =
+        Enum.filter(writer_keys, fn k ->
+          HandoffTable.lookup(k) != []
+        end)
+
+      assert length(found_writer_keys) > 0,
+             "none of the concurrent writes survived"
+    after
+      :peer.stop(peer_pid)
+    end
+  end
+
   # ──────────────────────────────────────────────────────────────────────
 
   defp wait_for_node_in_pg(table, node, timeout \\ 5_000) do

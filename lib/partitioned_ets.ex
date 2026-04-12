@@ -101,10 +101,13 @@ defmodule PartitionedEts do
   >     `terminate/2`, the entries it owned are gone. Replication is
   >     a separate feature and not implemented here.
   >
-  >   * **Brief race window during leave.** The moment between
-  >     `:pg.leave` and gossip propagating to peers may briefly route
-  >     writes to the leaving node. Join handoff uses `insert_new` to
-  >     avoid overwriting concurrent writes at the destination.
+  >   * **Brief race window during leave.** Leave handoff ships all
+  >     entries before leaving `:pg`, then does a second pass for any
+  >     writes that arrived during the first pass. The second pass uses
+  >     `insert_new` to avoid overwriting writes that went directly to
+  >     survivors. There is a small window between `:pg.leave` and
+  >     gossip propagating to peers where writes may still route to the
+  >     leaving node; these are captured by the second pass.
   >
   >   * **Handoff blocks the owner GenServer.** The iterate-and-ship
   >     work runs inline in `handle_info` (join) or `terminate`
@@ -490,11 +493,11 @@ defmodule PartitionedEts do
   #   - Join handoff uses `insert_new` so shipped entries never
   #     overwrite concurrent writes at the destination.
   #
-  #   - There is a brief race window during a leave between calling
-  #     `:pg.leave` and the gossip propagating to other nodes; remote
-  #     writes that hash to us during that window land on a table that
-  #     is about to be destroyed. Stagehand has the same window and
-  #     documents it the same way.
+  #   - Leave handoff uses a two-pass strategy: pass 1 ships all
+  #     entries via `insert` while still registered (no read misses),
+  #     then leaves :pg, waits for the local :pg monitor confirmation,
+  #     and does pass 2 via `insert_new` to catch writes that arrived
+  #     during pass 1 without clobbering direct writes to survivors.
 
   defp do_join_handoff(%{name: name}, joiner_node) do
     cfg = :persistent_term.get({__MODULE__, name, :config})
@@ -515,7 +518,7 @@ defmodule PartitionedEts do
       )
 
     Enum.each(to_move, fn {key, obj, target_pt} ->
-      case ship_entry(joiner_node, target_pt, obj) do
+      case ship_entry(joiner_node, target_pt, obj, :insert_new) do
         :ok -> :ets.delete(local_pt, key)
         {:error, _} -> :ok
       end
@@ -533,50 +536,167 @@ defmodule PartitionedEts do
     end
   end
 
-  defp do_leave_handoff(%{name: name}) do
+  defp do_leave_handoff(%{name: name, monitor_ref: ref}) do
     current_node = node()
     current_shards = shards(name, :forward)
     new_shards = Enum.reject(current_shards, fn {n, _} -> n == current_node end)
 
     if new_shards != [] do
-      drain_local_to(name, new_shards)
+      cfg = :persistent_term.get({__MODULE__, name, :config})
+      hash_module = cfg.hash
+      partition_tables = Tuple.to_list(cfg.partition_tables)
+
+      # Create temporary fingerprint tables on each destination node.
+      # These track what pass 1 shipped so pass 2 can detect direct writes.
+      fp_tables = create_fingerprint_tables(name, new_shards)
+
+      # Pass 1: ship all entries while still registered. We're still the
+      # authoritative owner, so use plain insert. Record fingerprints so
+      # pass 2 can distinguish stale pass-1 values from direct writes.
+      # Reads still route here — no misses.
+      ship_all_partitions(partition_tables, new_shards, hash_module, fp_tables)
+
+      # Leave :pg so new writes route to survivors.
+      Registry.unregister_name(name)
+
+      # Wait for the local :pg scope to confirm our leave.
+      receive do
+        {^ref, :leave, ^name, _pids} -> :ok
+      after
+        5_000 -> :ok
+      end
+
+      # Pass 2: conditionally ship entries that changed during pass 1.
+      # Only overwrites if the destination value still matches the pass-1
+      # fingerprint (no direct write landed).
+      ship_all_partitions_conditional(partition_tables, new_shards, hash_module, fp_tables)
+
+      # Clean up fingerprint tables.
+      cleanup_fingerprint_tables(fp_tables)
     end
 
     :ok
   end
 
-  defp drain_local_to(name, new_shards) do
-    # Leave :pg before shipping so other nodes start routing around
-    # us. There is a brief window where the gossip hasn't propagated
-    # yet — accepted, see the comment above.
-    Registry.unregister_name(name)
+  defp create_fingerprint_tables(name, shards) do
+    nodes = shards |> Enum.map(fn {n, _} -> n end) |> Enum.uniq()
 
-    cfg = :persistent_term.get({__MODULE__, name, :config})
-    hash_module = cfg.hash
-    partition_tables = Tuple.to_list(cfg.partition_tables)
+    Map.new(nodes, fn node ->
+      fp_name = :"#{name}_handoff_fp_#{:erlang.unique_integer([:positive])}"
 
-    Enum.each(partition_tables, fn local_pt ->
-      :ets.foldl(&ship_each(&1, &2, new_shards, hash_module), :ok, local_pt)
+      if node == node() do
+        table = :ets.new(fp_name, [:set, :public])
+        {node, table}
+      else
+        try do
+          table = :erpc.call(node, :ets, :new, [fp_name, [:set, :public]])
+          {node, table}
+        rescue
+          _ -> {node, nil}
+        end
+      end
     end)
   end
 
-  defp ship_each(obj, _acc, shards, hash_module) do
-    key = elem(obj, 0)
-    {target_node, target_pt} = hash_module.hash(key, shards)
-    ship_entry(target_node, target_pt, obj)
-    :ok
+  defp cleanup_fingerprint_tables(fp_tables) do
+    Enum.each(fp_tables, fn {node, table} ->
+      if table do
+        try do
+          if node == node() do
+            :ets.delete(table)
+          else
+            :erpc.call(node, :ets, :delete, [table])
+          end
+        rescue
+          _ -> :ok
+        end
+      end
+    end)
   end
 
-  defp ship_entry(target_node, target_table, obj) do
+  # Pass 1: insert + record fingerprint
+  defp ship_all_partitions(partition_tables, shards, hash_module, fp_tables) do
+    Enum.each(partition_tables, fn local_pt ->
+      :ets.foldl(
+        fn obj, :ok ->
+          key = elem(obj, 0)
+          {target_node, target_pt} = hash_module.hash(key, shards)
+          ship_entry(target_node, target_pt, obj, :insert)
+          record_fingerprint(target_node, fp_tables, obj)
+          :ok
+        end,
+        :ok,
+        local_pt
+      )
+    end)
+  end
+
+  defp record_fingerprint(target_node, fp_tables, obj) do
+    case Map.get(fp_tables, target_node) do
+      nil -> :ok
+      fp_table ->
+        key = elem(obj, 0)
+        fp = :erlang.phash2(obj)
+
+        if target_node == node() do
+          :ets.insert(fp_table, {key, fp})
+        else
+          try do
+            :erpc.call(target_node, :ets, :insert, [fp_table, {key, fp}])
+          rescue
+            _ -> :ok
+          end
+        end
+    end
+  end
+
+  # Pass 2: conditional insert using fingerprints
+  defp ship_all_partitions_conditional(partition_tables, shards, hash_module, fp_tables) do
+    Enum.each(partition_tables, fn local_pt ->
+      :ets.foldl(
+        fn obj, :ok ->
+          key = elem(obj, 0)
+          {target_node, target_pt} = hash_module.hash(key, shards)
+          fp_table = Map.get(fp_tables, target_node)
+          conditional_ship(target_node, target_pt, obj, fp_table)
+          :ok
+        end,
+        :ok,
+        local_pt
+      )
+    end)
+  end
+
+  defp conditional_ship(_target_node, _target_pt, _obj, nil), do: :ok
+
+  defp conditional_ship(target_node, target_pt, obj, fp_table) do
     if target_node == node() do
-      :ets.insert_new(target_table, obj)
+      PartitionedEts.Handoff.conditional_insert(target_pt, fp_table, obj)
+    else
+      try do
+        :erpc.call(target_node, __MODULE__, :__remote_conditional_insert__,
+          [target_pt, fp_table, obj])
+      rescue
+        _ -> :ok
+      end
+    end
+  end
+
+  @doc false
+  def __remote_conditional_insert__(data_table, fp_table, obj) do
+    PartitionedEts.Handoff.conditional_insert(data_table, fp_table, obj)
+  end
+
+  defp ship_entry(target_node, target_table, obj, insert_fn) do
+    if target_node == node() do
+      apply(:ets, insert_fn, [target_table, obj])
       :ok
     else
       try do
-        :erpc.call(target_node, :ets, :insert_new, [target_table, obj])
+        :erpc.call(target_node, :ets, insert_fn, [target_table, obj])
         :ok
       rescue
-        e -> {:error, e}
+        _e -> {:error, :erpc_failed}
       end
     end
   end
@@ -902,14 +1022,20 @@ defmodule PartitionedEts do
   # ── Routing helpers ──────────────────────────────────────────────────
 
   defp config(table) do
-    :persistent_term.get({__MODULE__, table, :config})
+    :persistent_term.get({__MODULE__, table, :config}, nil) ||
+      raise ArgumentError, "#{inspect(table)} is not running on this node"
   end
 
   defp partitioned_call(table, key, fun, args) do
     {key_node, partition_table} = key_shard(table, key)
 
     if key_node == node() do
-      apply(:ets, fun, [partition_table | tl(args)])
+      try do
+        apply(:ets, fun, [partition_table | tl(args)])
+      rescue
+        ArgumentError ->
+          raise ArgumentError, "#{inspect(table)} is not running on this node"
+      end
     else
       :erpc.call(key_node, __MODULE__, :__remote_dispatch__, [partition_table, fun, args])
     end
