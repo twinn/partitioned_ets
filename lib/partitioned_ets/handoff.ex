@@ -16,7 +16,8 @@ defmodule PartitionedEts.Handoff do
   Returns `true` if the insert was performed, `false` if skipped.
 
   Rules:
-    * No fingerprint for this key → insert (new entry, wasn't in pass 1)
+    * No fingerprint for this key → `insert_new` (missed by pass 1;
+      only insert if no direct write landed)
     * Key missing from data_table → insert (entry was deleted)
     * Fingerprint matches current value → insert (still stale from pass 1)
     * Fingerprint differs from current value → skip (direct write landed)
@@ -25,23 +26,31 @@ defmodule PartitionedEts.Handoff do
   def conditional_insert(data_table, fp_table, obj) do
     key = elem(obj, 0)
 
-    if should_insert?(data_table, fp_table, key) do
-      :ets.insert(data_table, obj)
-      true
-    else
-      false
+    case action(data_table, fp_table, key) do
+      :insert ->
+        :ets.insert(data_table, obj)
+        true
+
+      :insert_new ->
+        :ets.insert_new(data_table, obj)
+
+      :skip ->
+        false
     end
   end
 
-  defp should_insert?(data_table, fp_table, key) do
+  defp action(data_table, fp_table, key) do
     case :ets.lookup(fp_table, key) do
       [] ->
-        true
+        # No fingerprint — pass 1 missed this key. Use insert_new so
+        # we don't clobber a direct write that may have arrived at the
+        # destination after we left :pg.
+        :insert_new
 
       [{^key, fingerprint}] ->
         case :ets.lookup(data_table, key) do
-          [] -> true
-          [current] -> :erlang.phash2(current) == fingerprint
+          [] -> :insert
+          [current] -> if :erlang.phash2(current) == fingerprint, do: :insert, else: :skip
         end
     end
   end

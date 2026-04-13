@@ -56,14 +56,26 @@ defmodule PartitionedEts.HandoffFingerprintTest do
       assert :ets.lookup(data, :k) == [{:k, :v3}]
     end
 
-    test "inserts when key has no fingerprint (new entry, not in pass 1)", %{
+    test "inserts when key has no fingerprint and doesn't exist on destination", %{
       data: data,
       fp: fp
     } do
-      # Key didn't exist during pass 1, so no fingerprint.
-      # Pass 2 should insert it.
+      # Key didn't exist during pass 1 (no fingerprint) and doesn't
+      # exist on the destination. insert_new succeeds.
       assert Handoff.conditional_insert(data, fp, {:k, :new}) == true
       assert :ets.lookup(data, :k) == [{:k, :new}]
+    end
+
+    test "skips when key has no fingerprint but destination has a direct write", %{
+      data: data,
+      fp: fp
+    } do
+      # Pass 1 missed this key (no fingerprint). A direct write landed
+      # on the destination after we left :pg. insert_new returns false.
+      :ets.insert(data, {:k, :direct})
+
+      assert Handoff.conditional_insert(data, fp, {:k, :stale}) == false
+      assert :ets.lookup(data, :k) == [{:k, :direct}]
     end
 
     test "inserts when key doesn't exist on destination at all", %{data: data, fp: fp} do
