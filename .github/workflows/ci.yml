@@ -45,4 +45,6 @@ jobs:
       - run: mix credo --strict
       - run: epmd -daemon
       - run: mix test
+        env:
+          ERL_FLAGS: "-kernel prevent_overlapping_partitions false"
       - run: MIX_ENV=dev mix dialyzer
