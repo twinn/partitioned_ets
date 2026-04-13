@@ -389,10 +389,15 @@ defmodule PartitionedEts do
         do: callbacks,
         else: __MODULE__
 
+    clock_ref = :atomics.new(1, [])
+    shadow_name = :"#{name}_handoff_shadow"
+
     config = %{
       partition_count: partitions,
       partition_tables: List.to_tuple(partition_tables),
-      hash: hash_module
+      hash: hash_module,
+      clock_ref: clock_ref,
+      shadow_name: shadow_name
     }
 
     :persistent_term.put({__MODULE__, name, :config}, config)
@@ -546,15 +551,17 @@ defmodule PartitionedEts do
       hash_module = cfg.hash
       partition_tables = Tuple.to_list(cfg.partition_tables)
 
-      # Create temporary fingerprint tables on each destination node.
-      # These track what pass 1 shipped so pass 2 can detect direct writes.
-      fp_tables = create_fingerprint_tables(name, new_shards)
+      # Enter clock mode: create the shadow table so partitioned_call
+      # starts recording writes.
+      shadow = :ets.new(cfg.shadow_name, [:set, :public, :named_table])
+      pass1_clock = :atomics.get(cfg.clock_ref, 1)
+
+      # Create metadata tables on each destination node for conflict resolution.
+      meta_tables = create_meta_tables(name, new_shards)
 
       # Pass 1: ship all entries while still registered. We're still the
-      # authoritative owner, so use plain insert. Record fingerprints so
-      # pass 2 can distinguish stale pass-1 values from direct writes.
-      # Reads still route here — no misses.
-      ship_all_partitions(partition_tables, new_shards, hash_module, fp_tables)
+      # authoritative owner. Reads still route here — no misses.
+      ship_pass1(partition_tables, new_shards, hash_module, meta_tables, pass1_clock)
 
       # Leave :pg so new writes route to survivors.
       Registry.unregister_name(name)
@@ -566,30 +573,31 @@ defmodule PartitionedEts do
         5_000 -> :ok
       end
 
-      # Pass 2: conditionally ship entries that changed during pass 1.
-      # Only overwrites if the destination value still matches the pass-1
-      # fingerprint (no direct write landed).
-      ship_all_partitions_conditional(partition_tables, new_shards, hash_module, fp_tables)
+      # Pass 2: only ship entries that changed during pass 1 (identified
+      # by clock > pass1_clock). Uses clock-based conflict resolution on
+      # the destination.
+      ship_pass2(shadow, pass1_clock, partition_tables, new_shards, hash_module, meta_tables, cfg)
 
-      # Clean up fingerprint tables.
-      cleanup_fingerprint_tables(fp_tables)
+      # Exit clock mode and clean up.
+      :ets.delete(shadow)
+      cleanup_meta_tables(meta_tables)
     end
 
     :ok
   end
 
-  defp create_fingerprint_tables(name, shards) do
+  defp create_meta_tables(name, shards) do
     nodes = shards |> Enum.map(fn {n, _} -> n end) |> Enum.uniq()
 
     Map.new(nodes, fn node ->
-      fp_name = :"#{name}_handoff_fp_#{:erlang.unique_integer([:positive])}"
+      meta_name = :"#{name}_handoff_meta_#{:erlang.unique_integer([:positive])}"
 
       if node == node() do
-        table = :ets.new(fp_name, [:set, :public])
+        table = :ets.new(meta_name, [:set, :public])
         {node, table}
       else
         try do
-          table = :erpc.call(node, :ets, :new, [fp_name, [:set, :public]])
+          table = :erpc.call(node, :ets, :new, [meta_name, [:set, :public]])
           {node, table}
         rescue
           _ -> {node, nil}
@@ -598,8 +606,8 @@ defmodule PartitionedEts do
     end)
   end
 
-  defp cleanup_fingerprint_tables(fp_tables) do
-    Enum.each(fp_tables, fn {node, table} ->
+  defp cleanup_meta_tables(meta_tables) do
+    Enum.each(meta_tables, fn {node, table} ->
       if table do
         try do
           if node == node() do
@@ -614,15 +622,15 @@ defmodule PartitionedEts do
     end)
   end
 
-  # Pass 1: insert + record fingerprint
-  defp ship_all_partitions(partition_tables, shards, hash_module, fp_tables) do
+  # Pass 1: ship all entries via insert, record metadata with clock
+  defp ship_pass1(partition_tables, shards, hash_module, meta_tables, clock) do
     Enum.each(partition_tables, fn local_pt ->
       :ets.foldl(
         fn obj, :ok ->
           key = elem(obj, 0)
           {target_node, target_pt} = hash_module.hash(key, shards)
           ship_entry(target_node, target_pt, obj, :insert)
-          record_fingerprint(target_node, fp_tables, obj)
+          record_meta(target_node, meta_tables, obj, clock)
           :ok
         end,
         :ok,
@@ -631,36 +639,48 @@ defmodule PartitionedEts do
     end)
   end
 
-  defp record_fingerprint(target_node, fp_tables, obj) do
-    case Map.get(fp_tables, target_node) do
-      nil ->
-        :ok
-
-      fp_table ->
-        key = elem(obj, 0)
-        fp = :erlang.phash2(obj)
-
-        if target_node == node() do
-          :ets.insert(fp_table, {key, fp})
-        else
-          try do
-            :erpc.call(target_node, :ets, :insert, [fp_table, {key, fp}])
-          rescue
-            _ -> :ok
-          end
-        end
+  defp record_meta(target_node, meta_tables, obj, clock) do
+    case Map.get(meta_tables, target_node) do
+      nil -> :ok
+      meta_table -> do_record_meta(target_node, meta_table, obj, clock)
     end
   end
 
-  # Pass 2: conditional insert using fingerprints
-  defp ship_all_partitions_conditional(partition_tables, shards, hash_module, fp_tables) do
+  defp do_record_meta(target_node, meta_table, obj, clock) do
+    key = elem(obj, 0)
+    fp = :erlang.phash2(obj)
+    entry = {{key, fp}, clock}
+
+    if target_node == node() do
+      :ets.insert(meta_table, entry)
+    else
+      try do
+        :erpc.call(target_node, :ets, :insert, [meta_table, entry])
+      rescue
+        _ -> :ok
+      end
+    end
+  end
+
+  # Pass 2: only ship entries that changed during pass 1
+  defp ship_pass2(shadow, pass1_clock, partition_tables, shards, hash_module, meta_tables, _cfg) do
+    changed = PartitionedEts.Handoff.changed_since(shadow, pass1_clock)
+    changed_map = Map.new(changed)
+
     Enum.each(partition_tables, fn local_pt ->
       :ets.foldl(
         fn obj, :ok ->
           key = elem(obj, 0)
-          {target_node, target_pt} = hash_module.hash(key, shards)
-          fp_table = Map.get(fp_tables, target_node)
-          conditional_ship(target_node, target_pt, obj, fp_table)
+
+          case Map.fetch(changed_map, key) do
+            {:ok, clock} ->
+              {target_node, target_pt} = hash_module.hash(key, shards)
+              clock_ship(target_node, target_pt, obj, Map.get(meta_tables, target_node), clock)
+
+            :error ->
+              :ok
+          end
+
           :ok
         end,
         :ok,
@@ -669,14 +689,14 @@ defmodule PartitionedEts do
     end)
   end
 
-  defp conditional_ship(_target_node, _target_pt, _obj, nil), do: :ok
+  defp clock_ship(_target_node, _target_pt, _obj, nil, _clock), do: :ok
 
-  defp conditional_ship(target_node, target_pt, obj, fp_table) do
+  defp clock_ship(target_node, target_pt, obj, meta_table, clock) do
     if target_node == node() do
-      PartitionedEts.Handoff.conditional_insert(target_pt, fp_table, obj)
+      PartitionedEts.Handoff.clock_insert(target_pt, meta_table, obj, clock)
     else
       try do
-        :erpc.call(target_node, __MODULE__, :__remote_conditional_insert__, [target_pt, fp_table, obj])
+        :erpc.call(target_node, __MODULE__, :__remote_clock_insert__, [target_pt, meta_table, obj, clock])
       rescue
         _ -> :ok
       end
@@ -684,8 +704,8 @@ defmodule PartitionedEts do
   end
 
   @doc false
-  def __remote_conditional_insert__(data_table, fp_table, obj) do
-    PartitionedEts.Handoff.conditional_insert(data_table, fp_table, obj)
+  def __remote_clock_insert__(target_pt, meta_table, obj, clock) do
+    PartitionedEts.Handoff.clock_insert(target_pt, meta_table, obj, clock)
   end
 
   defp ship_entry(target_node, target_table, obj, insert_fn) do
@@ -1032,7 +1052,9 @@ defmodule PartitionedEts do
 
     if key_node == node() do
       try do
-        apply(:ets, fun, [partition_table | tl(args)])
+        result = apply(:ets, fun, [partition_table | tl(args)])
+        maybe_record_clock(table, key, fun)
+        result
       rescue
         _e in ArgumentError ->
           reraise ArgumentError, "#{inspect(table)} is not running on this node", __STACKTRACE__
@@ -1041,6 +1063,24 @@ defmodule PartitionedEts do
       :erpc.call(key_node, __MODULE__, :__remote_dispatch__, [partition_table, fun, args])
     end
   end
+
+  # Only record writes (not reads) in clock mode. Clock mode is active
+  # when the shadow table exists (created at handoff start, destroyed
+  # at handoff end). :ets.whereis is O(1).
+  @write_fns [:insert, :insert_new, :delete, :delete_object, :update_counter, :update_element]
+
+  defp maybe_record_clock(table, key, fun) when fun in @write_fns do
+    cfg = :persistent_term.get({__MODULE__, table, :config}, nil)
+
+    if cfg do
+      case :ets.whereis(cfg.shadow_name) do
+        :undefined -> :ok
+        shadow -> PartitionedEts.Handoff.record_write(shadow, cfg.clock_ref, key)
+      end
+    end
+  end
+
+  defp maybe_record_clock(_table, _key, _fun), do: :ok
 
   defp all_call(table, fun, args, direction \\ :forward) do
     nodes = fetch_nodes(table, direction)
