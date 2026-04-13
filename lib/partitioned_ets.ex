@@ -442,8 +442,9 @@ defmodule PartitionedEts do
   @impl GenServer
   def terminate(reason, %{name: name} = state) do
     cfg = :persistent_term.get({__MODULE__, name, :config}, nil)
+    distributed? = cfg != nil and cfg.distributed
 
-    if (graceful_shutdown?(reason) and cfg) && cfg.distributed do
+    if graceful_shutdown?(reason) and distributed? do
       do_leave_handoff(state)
     end
 
