@@ -1,5 +1,6 @@
 # PartitionedEts
 
+[![CI](https://github.com/twinn/partitioned_ets/actions/workflows/ci.yml/badge.svg)](https://github.com/twinn/partitioned_ets/actions/workflows/ci.yml)
 [![Hex.pm](https://img.shields.io/hexpm/v/partitioned_ets.svg)](https://hex.pm/packages/partitioned_ets)
 [![HexDocs](https://img.shields.io/badge/hex-docs-blue.svg)](https://hexdocs.pm/partitioned_ets)
 
