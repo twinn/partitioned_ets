@@ -27,7 +27,7 @@ defmodule PartitionedEts.HandoffClockTest do
       assert c2 > 0
     end
 
-    test "changed_since/2 returns only keys written after the given clock" do
+    test "only writes after a checkpoint have clock values above it" do
       clock = :atomics.new(1, [])
       shadow = :ets.new(:shadow, [:set, :public])
 
@@ -41,13 +41,16 @@ defmodule PartitionedEts.HandoffClockTest do
       # Update a key that was written before the checkpoint
       Handoff.record_write(shadow, clock, :before1)
 
-      changed = Handoff.changed_since(shadow, checkpoint)
-      changed_keys = changed |> Enum.map(fn {k, _c} -> k end) |> Enum.sort()
+      # Verify clock values directly from the shadow table
+      [{:before1, c_before1}] = :ets.lookup(shadow, :before1)
+      [{:before2, c_before2}] = :ets.lookup(shadow, :before2)
+      [{:after1, c_after1}] = :ets.lookup(shadow, :after1)
+      [{:after2, c_after2}] = :ets.lookup(shadow, :after2)
 
-      assert :after1 in changed_keys
-      assert :after2 in changed_keys
-      assert :before1 in changed_keys, "updated key should be included"
-      refute :before2 in changed_keys
+      assert c_after1 > checkpoint
+      assert c_after2 > checkpoint
+      assert c_before1 > checkpoint, "updated key should have a clock above checkpoint"
+      assert c_before2 <= checkpoint
     end
   end
 
