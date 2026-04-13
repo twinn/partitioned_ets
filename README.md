@@ -115,6 +115,7 @@ throughout.
 | `:table_opts` | `list` | required | Passed to `:ets.new/2`. Must include `:named_table` and `:public`. |
 | `:partitions` | `pos_integer` | `1` | Number of ETS tables per node. Higher values reduce write contention at the cost of increased fan-out. |
 | `:callbacks` | `module \| nil` | `nil` | Optional module exporting any subset of `hash/2`, `node_added/1`, `node_removed/1`. |
+| `:distributed` | `boolean` | `true` | When `false`, the table runs on a single node with no cluster registration or handoff. Useful for write-contention relief without distribution overhead. |
 
 ## Limitations
 

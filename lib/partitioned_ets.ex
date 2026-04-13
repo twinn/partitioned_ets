@@ -302,6 +302,11 @@ defmodule PartitionedEts do
       macro form, the using module *is* the callbacks module and the
       generated defaults are marked `defoverridable`.
 
+    * `:distributed` — boolean, optional, default `true`. When `false`,
+      the table runs on a single node with no cluster registration or
+      handoff. Useful for write-contention relief via partitioning
+      without distribution overhead.
+
   ## Examples
 
       # Simple module-form
