@@ -331,16 +331,24 @@ defmodule PartitionedEts do
     table_opts = opts |> Keyword.fetch!(:table_opts) |> List.wrap()
     partitions = Keyword.get(opts, :partitions, 1)
     callbacks = Keyword.get(opts, :callbacks)
+    distributed = Keyword.get(opts, :distributed, true)
 
     validate_table_opts!(table_opts)
     validate_partitions!(partitions)
 
     partition_tables = build_partition_tables(name, partitions)
 
+    via =
+      if distributed do
+        {:via, PgRegistry, {Registry.scope(), name, %{partition_tables: partition_tables}}}
+      else
+        {:via, Elixir.Registry, {PartitionedEts.LocalRegistry, name}}
+      end
+
     GenServer.start_link(
       __MODULE__,
-      {name, table_opts, partition_tables, callbacks},
-      name: {:via, PgRegistry, {Registry.scope(), name, %{partition_tables: partition_tables}}}
+      {name, table_opts, partition_tables, callbacks, distributed},
+      name: via
     )
   end
 
@@ -374,7 +382,7 @@ defmodule PartitionedEts do
   # ── GenServer callbacks ──────────────────────────────────────────────
 
   @impl GenServer
-  def init({name, table_opts, partition_tables, callbacks}) do
+  def init({name, table_opts, partition_tables, callbacks, distributed}) do
     # Trap exits so terminate/2 runs on graceful shutdown (e.g. from
     # a supervisor sending a :shutdown signal). Without this, the
     # process exits immediately on any EXIT signal and the leave
@@ -400,12 +408,17 @@ defmodule PartitionedEts do
       partition_tables: List.to_tuple(partition_tables),
       hash: hash_module,
       clock_ref: clock_ref,
-      shadow_name: shadow_name
+      shadow_name: shadow_name,
+      distributed: distributed
     }
 
     :persistent_term.put({__MODULE__, name, :config}, config)
 
-    {monitor_ref, _initial_members} = Registry.monitor(name)
+    monitor_ref =
+      if distributed do
+        {ref, _initial_members} = Registry.monitor(name)
+        ref
+      end
 
     {:ok,
      %__MODULE__{
@@ -423,7 +436,9 @@ defmodule PartitionedEts do
 
   @impl GenServer
   def terminate(reason, %{name: name} = state) do
-    if graceful_shutdown?(reason) do
+    cfg = :persistent_term.get({__MODULE__, name, :config}, nil)
+
+    if (graceful_shutdown?(reason) and cfg) && cfg.distributed do
       do_leave_handoff(state)
     end
 
@@ -1168,15 +1183,21 @@ defmodule PartitionedEts do
   # the local node if its tables no longer exist (brief window between
   # GenServer exit and PgRegistry processing the EXIT).
   defp fetch_nodes(table) do
-    local_node = node()
-    local_present? = local_present?(table)
+    cfg = config(table)
 
-    table
-    |> Registry.members()
-    |> Enum.map(fn {pid, _meta} -> :erlang.node(pid) end)
-    |> Enum.uniq()
-    |> Enum.reject(fn n -> n == local_node and not local_present? end)
-    |> Enum.sort()
+    if cfg.distributed do
+      local_node = node()
+      local_present? = local_present?(table)
+
+      table
+      |> Registry.members()
+      |> Enum.map(fn {pid, _meta} -> :erlang.node(pid) end)
+      |> Enum.uniq()
+      |> Enum.reject(fn n -> n == local_node and not local_present? end)
+      |> Enum.sort()
+    else
+      [node()]
+    end
   end
 
   defp local_present?(table) do
@@ -1204,6 +1225,24 @@ defmodule PartitionedEts do
   # `:partitions` count and therefore the same partition table names.
 
   defp shards(table, direction) do
+    cfg = config(table)
+
+    shards =
+      if cfg.distributed do
+        distributed_shards(table, cfg)
+      else
+        local_shards(cfg)
+      end
+
+    maybe_reverse(shards, direction)
+  end
+
+  defp local_shards(cfg) do
+    pts = Tuple.to_list(cfg.partition_tables)
+    for pt <- pts, do: {node(), pt}
+  end
+
+  defp distributed_shards(table, _cfg) do
     local_node = node()
     local_present? = local_present?(table)
 
@@ -1214,17 +1253,14 @@ defmodule PartitionedEts do
         :erlang.node(pid) == local_node and not local_present?
       end)
 
-    shards =
-      Enum.flat_map(members, fn {pid, meta} ->
-        n = :erlang.node(pid)
-        pts = partition_tables_for(meta, table, n)
-        for pt <- pts, do: {n, pt}
-      end)
-
-    shards
+    members
+    |> Enum.flat_map(fn {pid, meta} ->
+      n = :erlang.node(pid)
+      pts = partition_tables_for(meta, table, n)
+      for pt <- pts, do: {n, pt}
+    end)
     |> Enum.uniq()
     |> Enum.sort()
-    |> maybe_reverse(direction)
   end
 
   # Extract partition tables from PgRegistry metadata. Falls back to
@@ -1345,19 +1381,22 @@ defmodule PartitionedEts do
   defmacro __using__(opts) do
     table_opts = Keyword.fetch!(opts, :table_opts)
     partitions = Keyword.get(opts, :partitions, 1)
+    distributed = Keyword.get(opts, :distributed, true)
 
     quote location: :keep do
       @behaviour PartitionedEts
 
       @partitioned_ets_table_opts unquote(table_opts)
       @partitioned_ets_partitions unquote(partitions)
+      @partitioned_ets_distributed unquote(distributed)
 
       def child_spec(_opts) do
         PartitionedEts.child_spec(
           name: __MODULE__,
           table_opts: @partitioned_ets_table_opts,
           partitions: @partitioned_ets_partitions,
-          callbacks: __MODULE__
+          callbacks: __MODULE__,
+          distributed: @partitioned_ets_distributed
         )
       end
 
@@ -1366,7 +1405,8 @@ defmodule PartitionedEts do
           name: __MODULE__,
           table_opts: @partitioned_ets_table_opts,
           partitions: @partitioned_ets_partitions,
-          callbacks: __MODULE__
+          callbacks: __MODULE__,
+          distributed: @partitioned_ets_distributed
         )
       end
 

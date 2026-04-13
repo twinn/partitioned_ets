@@ -56,7 +56,17 @@ defmodule PartitionedEtsTest do
     start_supervised(Table)
 
     on_exit(fn ->
-      Table.delete_all_objects()
+      # Clean all nodes directly — the local GenServer may already
+      # be stopped by start_supervised cleanup at this point.
+      for node <- [node() | Node.list()] do
+        try do
+          :erpc.call(node, :ets, :delete_all_objects, [Table])
+        rescue
+          _ -> :ok
+        catch
+          _, _ -> :ok
+        end
+      end
     end)
 
     :ok

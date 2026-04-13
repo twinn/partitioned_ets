@@ -51,7 +51,19 @@ defmodule PartitionedEts.HandoffTest do
     start_supervised!(HandoffTable)
     # Wait until all existing nodes see us
     wait_for_full_membership(HandoffTable, length(Node.list()) + 1)
-    on_exit(fn -> HandoffTable.delete_all_objects() end)
+
+    on_exit(fn ->
+      for node <- [node() | Node.list()] do
+        try do
+          :erpc.call(node, :ets, :delete_all_objects, [HandoffTable])
+        rescue
+          _ -> :ok
+        catch
+          _, _ -> :ok
+        end
+      end
+    end)
+
     :ok
   end
 
