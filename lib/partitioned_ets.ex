@@ -5,9 +5,8 @@ defmodule PartitionedEts do
   `PartitionedEts` exposes the same API surface as `:ets`, but routes each
   operation to a single shard chosen by [rendezvous hashing
   (HRW)](https://en.wikipedia.org/wiki/Rendezvous_hashing) over the
-  cluster's `(node, partition)` shard space. The canonical API is
-  module-shaped: every function takes the table name as its first
-  argument, mirroring `:ets` exactly.
+  cluster's `(node, partition)` shard space. Every function takes the
+  table name as its first argument, mirroring `:ets`.
 
       children = [
         {PartitionedEts,
@@ -37,11 +36,10 @@ defmodule PartitionedEts do
   and call `:ets` either locally or via `:erpc` to the owning node.
   The GenServer is off the hot path.
 
-  `:pg` (Erlang's process-group module) carries cluster membership.
-  Every owner GenServer calls `:pg.monitor/2` on its own group in
-  `init/1` so it can react to join/leave events with handoff; the
-  membership view itself is just `:pg.get_members/2`, read lock-free
-  from the calling process on every routing call.
+  `PgRegistry` carries cluster membership. Each owner GenServer
+  registers with its partition table names as metadata, enabling
+  heterogeneous partition counts across the cluster. The membership
+  view is read lock-free from ETS on every routing call.
 
   ## Partitions
 
@@ -54,24 +52,16 @@ defmodule PartitionedEts do
   usually fine; for contended writes `System.schedulers_online()` is
   a reasonable starting point.
 
-  All nodes hosting the same logical table must currently use the
-  same `:partitions` value — heterogeneous per-node partition counts
-  are a future improvement.
+  Nodes hosting the same logical table may use different `:partitions`
+  values. Each node's partition layout is advertised via PgRegistry
+  metadata, so routing always uses the correct shard set.
 
   ## Routing
 
-  Every key-based operation picks the single shard whose HRW weight
-  is highest:
-
-      hash(key, shards) =
-        Enum.max_by(shards, fn shard -> :erlang.phash2({key, shard}) end)
-
-  HRW has the property that **adding or removing one shard remaps
-  only `~1/total_shards` of keys**; all other keys keep the same
-  shard. This is the foundation of the handoff work: a single node
-  joining or leaving only requires moving a small slice of the data,
-  not the whole table. With modulo hashing (`phash2(key, N)`), by
-  contrast, adding one node would remap almost every key.
+  The default routing uses [rendezvous hashing
+  (HRW)](https://en.wikipedia.org/wiki/Rendezvous_hashing), which
+  minimizes key movement when the shard set changes — adding or
+  removing a node remaps only ~1/total_shards of keys.
 
   Override routing by passing a `:callbacks` module to `start_link/1`
   that exports `hash/2`, or by defining `hash/2` on a `use
@@ -186,7 +176,7 @@ defmodule PartitionedEts do
 
   The `use PartitionedEts, table_opts: [...], partitions: N` macro
   generates a one-module-per-table wrapper. The generated functions
-  delegate to the canonical module API:
+  delegate to the module-level API:
 
       defmodule MyApp.Cache do
         use PartitionedEts, table_opts: [:named_table, :public], partitions: 16
@@ -977,10 +967,8 @@ defmodule PartitionedEts do
   #
   # A "shard" is a {node, partition_table} pair. Iterating shards is
   # what powers fan-out reads, paginated scans, find/fold, and
-  # next/prev. The shard order is nodes-major (sorted), partitions-
-  # minor (in their stored order). Phase 3 assumes a homogeneous
-  # partition layout across the cluster — each node has the same
-  # `:partitions` count and therefore the same partition table names.
+  # next/prev. Each node's partition tables are read from PgRegistry
+  # metadata, supporting heterogeneous partition counts.
 
   defp shards(table, direction) do
     cfg = config(table)

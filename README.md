@@ -112,7 +112,7 @@ throughout.
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `:name` | `atom` | required | Logical table name. Used as the ETS table name (when `partitions: 1`) or prefix, the `:pg` group key, and the `:via` registration name. |
+| `:name` | `atom` | required | Logical table name. Used as the ETS table name (when `partitions: 1`) or prefix, the PgRegistry group key, and the `:via` registration name. |
 | `:table_opts` | `list` | required | Passed to `:ets.new/2`. Must include `:named_table` and `:public`. |
 | `:partitions` | `pos_integer` | `1` | Number of ETS tables per node. Higher values reduce write contention at the cost of increased fan-out. |
 | `:callbacks` | `module \| nil` | `nil` | Optional module exporting any subset of `hash/2`, `node_added/1`, `node_removed/1`. |
@@ -125,8 +125,6 @@ throughout.
 - **Handoff blocks the owner GenServer.** For large tables, handoff may exceed
   the default supervisor shutdown timeout. Increase the `shutdown:` value in
   the child spec if needed.
-- **Homogeneous partition count assumed.** All nodes hosting the same logical
-  table must use the same `:partitions` value.
 - **Ordered-set semantics are not preserved across shards.** `first/1`,
   `last/1`, `next/2`, and `prev/2` iterate shards in a deterministic but not
   globally ordered sequence.
