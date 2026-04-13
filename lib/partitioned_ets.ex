@@ -80,8 +80,8 @@ defmodule PartitionedEts do
 
   ## Handoff
 
-  When the cluster membership changes, affected entries are physically
-  transferred so that data and routing stay in sync:
+  When the cluster membership changes, affected entries are transferred
+  between nodes so that data and routing stay in sync:
 
     * **Join** — when a new node joins, every existing node iterates
       its local entries, ships the keys whose new HRW shard lives on
@@ -335,10 +335,12 @@ defmodule PartitionedEts do
     validate_table_opts!(table_opts)
     validate_partitions!(partitions)
 
+    partition_tables = build_partition_tables(name, partitions)
+
     GenServer.start_link(
       __MODULE__,
-      {name, table_opts, partitions, callbacks},
-      name: {:via, Registry, name}
+      {name, table_opts, partition_tables, callbacks},
+      name: {:via, PgRegistry, {Registry.scope(), name, %{partition_tables: partition_tables}}}
     )
   end
 
@@ -372,14 +374,12 @@ defmodule PartitionedEts do
   # ── GenServer callbacks ──────────────────────────────────────────────
 
   @impl GenServer
-  def init({name, table_opts, partitions, callbacks}) do
+  def init({name, table_opts, partition_tables, callbacks}) do
     # Trap exits so terminate/2 runs on graceful shutdown (e.g. from
     # a supervisor sending a :shutdown signal). Without this, the
     # process exits immediately on any EXIT signal and the leave
     # handoff never fires.
     Process.flag(:trap_exit, true)
-
-    partition_tables = build_partition_tables(name, partitions)
 
     Enum.each(partition_tables, fn pt ->
       :ets.new(pt, table_opts)
@@ -396,7 +396,7 @@ defmodule PartitionedEts do
     shadow_name = :"#{name}_handoff_shadow"
 
     config = %{
-      partition_count: partitions,
+      partition_count: length(partition_tables),
       partition_tables: List.to_tuple(partition_tables),
       hash: hash_module,
       clock_ref: clock_ref,
@@ -405,9 +405,7 @@ defmodule PartitionedEts do
 
     :persistent_term.put({__MODULE__, name, :config}, config)
 
-    # Monitor only this table's group; raw :pg.monitor avoids the
-    # cluster-wide event fan-out from monitor_scope/1.
-    {monitor_ref, _initial_pids} = :pg.monitor(Registry, name)
+    {monitor_ref, _initial_members} = Registry.monitor(name)
 
     {:ok,
      %__MODULE__{
@@ -439,8 +437,8 @@ defmodule PartitionedEts do
   defp graceful_shutdown?(_), do: false
 
   @impl GenServer
-  def handle_info({ref, :join, group, pids}, %{monitor_ref: ref, name: group, callbacks: callbacks} = state) do
-    joiner_node = pids |> hd() |> :erlang.node()
+  def handle_info({ref, :join, group, entries}, %{monitor_ref: ref, name: group, callbacks: callbacks} = state) do
+    joiner_node = entries |> hd() |> elem(0) |> :erlang.node()
 
     # Run join handoff first so the user-visible node_added callback
     # only fires once data has been moved to the new node. We skip the
@@ -460,9 +458,9 @@ defmodule PartitionedEts do
     {:noreply, state}
   end
 
-  def handle_info({ref, :leave, group, pids}, %{monitor_ref: ref, name: group, callbacks: callbacks} = state) do
+  def handle_info({ref, :leave, group, entries}, %{monitor_ref: ref, name: group, callbacks: callbacks} = state) do
     if callbacks && function_exported?(callbacks, :node_removed, 1) do
-      node = pids |> hd() |> :erlang.node()
+      node = entries |> hd() |> elem(0) |> :erlang.node()
       Task.start(fn -> callbacks.node_removed(node) end)
     end
 
@@ -474,7 +472,7 @@ defmodule PartitionedEts do
   # ── Handoff ────────────────────────────────────────────────────────
   #
   # When the cluster membership changes, HRW remaps ~1/total_shards
-  # of keys. Handoff physically moves the affected entries so data
+  # of keys. Handoff moves the affected entries so data
   # and routing stay in sync. Both halves run inline in the GenServer.
   #
   # Join: existing nodes iterate local partitions, ship keys whose
@@ -558,7 +556,7 @@ defmodule PartitionedEts do
       ship_pass1(partition_tables, new_shards, hash_module, meta_tables, pass1_clock)
 
       # Leave :pg so new writes route to survivors.
-      Registry.unregister_name(name)
+      PgRegistry.unregister_name({Registry.scope(), name})
 
       # Wait for the local :pg scope to confirm our leave.
       receive do
@@ -1159,24 +1157,23 @@ defmodule PartitionedEts do
 
   defp key_shard(table, key) do
     cfg = config(table)
-    shards = shards(table, :forward)
-    cfg.hash.hash(key, shards)
+
+    case shards(table, :forward) do
+      [] -> raise ArgumentError, "#{inspect(table)} is not running on this node"
+      shards -> cfg.hash.hash(key, shards)
+    end
   end
 
+  # Returns a sorted list of unique nodes hosting this table, excluding
+  # the local node if its tables no longer exist (brief window between
+  # GenServer exit and PgRegistry processing the EXIT).
   defp fetch_nodes(table) do
-    # Exclude the local node when its named ETS tables no longer exist.
-    # There is a brief window between the local owner GenServer exiting
-    # (which destroys all of its named partition ETS tables) and `:pg`
-    # processing the resulting process EXIT and removing the dead pid
-    # from the group. During that window, `Registry.members/1` still
-    # returns the dead local pid, and routing to the local node would
-    # fail with `:badarg` because the named tables are gone.
     local_node = node()
     local_present? = local_present?(table)
 
     table
     |> Registry.members()
-    |> Enum.map(&:erlang.node/1)
+    |> Enum.map(fn {pid, _meta} -> :erlang.node(pid) end)
     |> Enum.uniq()
     |> Enum.reject(fn n -> n == local_node and not local_present? end)
     |> Enum.sort()
@@ -1207,10 +1204,42 @@ defmodule PartitionedEts do
   # `:partitions` count and therefore the same partition table names.
 
   defp shards(table, direction) do
-    nodes = fetch_nodes(table, direction)
-    pts = config(table).partition_tables |> Tuple.to_list() |> maybe_reverse(direction)
+    local_node = node()
+    local_present? = local_present?(table)
 
-    for n <- nodes, pt <- pts, do: {n, pt}
+    members =
+      table
+      |> Registry.members()
+      |> Enum.reject(fn {pid, _meta} ->
+        :erlang.node(pid) == local_node and not local_present?
+      end)
+
+    shards =
+      Enum.flat_map(members, fn {pid, meta} ->
+        n = :erlang.node(pid)
+        pts = partition_tables_for(meta, table, n)
+        for pt <- pts, do: {n, pt}
+      end)
+
+    shards
+    |> Enum.uniq()
+    |> Enum.sort()
+    |> maybe_reverse(direction)
+  end
+
+  # Extract partition tables from PgRegistry metadata. Falls back to
+  # local config when metadata is nil (e.g. during init before
+  # update_value has been called).
+  defp partition_tables_for(%{partition_tables: pts}, _table, _node) when is_list(pts), do: pts
+
+  defp partition_tables_for(_meta, table, node) do
+    if node == node() do
+      Tuple.to_list(config(table).partition_tables)
+    else
+      # Remote node hasn't published metadata yet — fall back to
+      # local config (homogeneous assumption as a safe default).
+      Tuple.to_list(config(table).partition_tables)
+    end
   end
 
   defp maybe_reverse(list, :forward), do: list

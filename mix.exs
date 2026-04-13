@@ -66,6 +66,7 @@ defmodule PartitionedEts.MixProject do
 
   defp deps do
     [
+      {:pg_registry, "~> 0.4.1"},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:styler, "~> 1.11", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},

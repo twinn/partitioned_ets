@@ -1,36 +1,15 @@
 defmodule PartitionedEts.Registry do
   @moduledoc false
 
-  # Wrapper around the :pg scope used by PartitionedEts. Provides the
-  # `:via` integration so PartitionedEts GenServers can register
-  # themselves with `name: {:via, PartitionedEts.Registry, name}`.
-  #
-  # The :pg scope itself is started as a child of `PartitionedEts.Application`,
-  # not from inside this module.
+  # Thin wrapper around PgRegistry for cluster membership queries.
+  # The PgRegistry scope is started by `PartitionedEts.Application`
+  # with `keys: :unique` — one owner GenServer per table name per node.
 
-  def members(name), do: :pg.get_members(__MODULE__, name)
+  @scope __MODULE__
 
-  def whereis_name(name) do
-    case :pg.get_local_members(__MODULE__, name) do
-      [pid | _] -> pid
-      _ -> :undefined
-    end
-  end
+  def scope, do: @scope
 
-  def register_name(name, pid) do
-    :pg.join(__MODULE__, name, pid)
-    :yes
-  end
+  def members(name), do: PgRegistry.lookup(@scope, name)
 
-  def unregister_name(name) do
-    :pg.leave(__MODULE__, name, self())
-    :ok
-  end
-
-  def send(name, msg) do
-    case whereis_name(name) do
-      :undefined -> :erlang.error(:badarg, [{name, msg}])
-      pid -> Kernel.send(pid, msg)
-    end
-  end
+  def monitor(name), do: PgRegistry.monitor(@scope, name)
 end

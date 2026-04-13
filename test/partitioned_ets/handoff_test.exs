@@ -41,11 +41,16 @@ defmodule PartitionedEts.HandoffTest do
       Cluster.start(node, [HandoffTable])
     end)
 
+    # Wait for PgRegistry gossip to propagate between all peers
+    wait_for_full_membership(HandoffTable, 2)
+
     :ok
   end
 
   setup do
     start_supervised!(HandoffTable)
+    # Wait until all existing nodes see us
+    wait_for_full_membership(HandoffTable, length(Node.list()) + 1)
     on_exit(fn -> HandoffTable.delete_all_objects() end)
     :ok
   end
@@ -264,33 +269,27 @@ defmodule PartitionedEts.HandoffTest do
 
   # ──────────────────────────────────────────────────────────────────────
 
-  defp wait_for_node_in_pg(table, node, timeout \\ 5_000) do
-    # Every node in the cluster must see `node` as a member. Polling
-    # only the local node's :pg state isn't enough — :pg is gossiped
-    # and other nodes may lag behind briefly.
+  defp wait_for_node_in_pg(table, target_node, timeout \\ 5_000) do
     wait_until(timeout, fn ->
-      Enum.all?(all_known_nodes(node), fn n ->
-        members = :erpc.call(n, :pg, :get_members, [PartitionedEts.Registry, table])
-        node in Enum.map(members, &:erlang.node/1)
-      end)
+      Enum.all?(all_known_nodes(target_node), &node_in_members?(&1, table, target_node))
     end)
   end
 
-  defp wait_for_node_not_in_pg(table, node, timeout \\ 5_000) do
+  defp wait_for_node_not_in_pg(table, target_node, timeout \\ 5_000) do
     wait_until(timeout, fn ->
-      Enum.all?([Node.self() | Node.list()], fn n ->
-        members =
-          try do
-            :erpc.call(n, :pg, :get_members, [PartitionedEts.Registry, table])
-          catch
-            # If the node we're asking about is already gone, that's
-            # obviously "not in :pg".
-            :error, _ -> []
-          end
-
-        node not in Enum.map(members, &:erlang.node/1)
-      end)
+      Enum.all?([Node.self() | Node.list()], &(not node_in_members?(&1, table, target_node)))
     end)
+  end
+
+  defp node_in_members?(query_node, table, target_node) do
+    members =
+      try do
+        :erpc.call(query_node, PgRegistry, :lookup, [PartitionedEts.Registry, table])
+      catch
+        :error, _ -> []
+      end
+
+    target_node in Enum.map(members, fn {pid, _meta} -> :erlang.node(pid) end)
   end
 
   # Includes `extra` in case it's the newly-joined node we want to
@@ -322,13 +321,28 @@ defmodule PartitionedEts.HandoffTest do
     end
   end
 
+  # Wait until every node in the cluster sees at least `expected_count`
+  # members for this table in PgRegistry. Ensures gossip has propagated.
+  defp wait_for_full_membership(table, expected_count, timeout \\ 5_000) do
+    wait_until(timeout, fn ->
+      Enum.all?([Node.self() | Node.list()], fn n ->
+        try do
+          members = :erpc.call(n, PgRegistry, :lookup, [PartitionedEts.Registry, table])
+          length(members) >= expected_count
+        catch
+          :error, _ -> false
+        end
+      end)
+    end)
+  end
+
   # Block until every :pg-registered PartitionedEts GenServer has
   # drained its mailbox up to the current moment. Since handoff runs
   # inline in handle_info, a :sys.get_state call that lands in the
   # mailbox *after* a :pg :join event is guaranteed to return only
   # after the join's handoff is complete.
   defp sync_all_genservers(table) do
-    for pid <- :pg.get_members(PartitionedEts.Registry, table) do
+    for {pid, _meta} <- PgRegistry.lookup(PartitionedEts.Registry, table) do
       try do
         :sys.get_state(pid, 5_000)
       catch
@@ -349,7 +363,7 @@ defmodule PartitionedEts.HandoffTest do
 
   defp key_owning_node(table, key) do
     for_result =
-      for pid <- :pg.get_members(PartitionedEts.Registry, table),
+      for {pid, _meta} <- PgRegistry.lookup(PartitionedEts.Registry, table),
           node <- [:erlang.node(pid)],
           into: [] do
         {node, table}

@@ -8,7 +8,7 @@ A distributed, partitioned ETS table for Elixir.
 `PartitionedEts` exposes the full `:ets` API, but routes every operation to a
 single `{node, partition}` shard selected by
 [rendezvous hashing (HRW)](https://en.wikipedia.org/wiki/Rendezvous_hashing)
-over the cluster. On membership changes it physically moves the affected entries
+over the cluster. On membership changes it transfers the affected entries
 between shards so that data and routing remain in sync.
 
 ## Installation
@@ -81,20 +81,12 @@ nodes and all partition tables.
 
 ### Routing
 
-Every operation targeting a single key selects the shard whose HRW weight is
-highest:
-
-```elixir
-Enum.max_by(shards, fn shard -> :erlang.phash2({key, shard}) end)
-```
-
-When the target shard is local, the operation is a direct `:ets` call with no
-GenServer hop. When the target is remote, the operation is dispatched via a
-single `:erpc.call`. Fan-out operations (`match/2`, `select/2`, `tab2list/1`,
+Single-key operations use rendezvous hashing to select a shard. Local
+operations go directly to ETS; remote operations are dispatched via
+`:erpc.call`. Fan-out operations (`match/2`, `select/2`, `tab2list/1`,
 `foldl/3`, etc.) iterate every shard and merge results.
 
-HRW guarantees that adding or removing one shard remaps only approximately
-`1/total_shards` of keys.
+Adding or removing a node remaps only approximately `1/total_shards` of keys.
 
 ### Handoff
 
