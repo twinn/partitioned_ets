@@ -6,6 +6,24 @@ defmodule PartitionedEts.LocalOnlyTest do
 
   use ExUnit.Case, async: true
 
+  defmodule MacroTable do
+    @moduledoc false
+    use PartitionedEts, table_opts: [:named_table, :public], partitions: 4, distributed: false
+  end
+
+  test "use macro with distributed: false" do
+    {:ok, _} = MacroTable.start_link()
+
+    MacroTable.insert({:key, :value})
+    assert [{:key, :value}] = MacroTable.lookup(:key)
+
+    for i <- 1..50, do: MacroTable.insert({:"k_#{i}", i})
+    results = MacroTable.match({:"$1", :"$2"})
+    assert length(results) == 51
+
+    assert PgRegistry.lookup(PartitionedEts.Registry, MacroTable) == []
+  end
+
   test "basic insert and lookup" do
     {:ok, _} =
       PartitionedEts.start_link(
