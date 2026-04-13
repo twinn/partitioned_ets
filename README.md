@@ -23,7 +23,7 @@ def deps do
 end
 ```
 
-Requires Elixir `~> 1.19` and OTP 28+.
+Requires Elixir `~> 1.15` and OTP 26+.
 
 ## Usage
 
@@ -100,9 +100,20 @@ HRW guarantees that adding or removing one shard remaps only approximately
 
 On graceful join, every existing node iterates its local entries, identifies
 keys whose new HRW shard is on the joining node, and ships them via `:erpc`.
-On graceful leave (`terminate/2` with a normal shutdown reason), the leaving
-node ships every local entry to its new owner under the shard set excluding
-itself.
+On graceful leave, the leaving node ships every local entry to its new owner
+using a two-pass strategy that avoids read misses during the transfer.
+
+### Consistency model
+
+PartitionedEts is **eventually consistent** with **last-writer-wins**
+semantics during topology changes. In steady state (no nodes joining or
+leaving), every operation is immediately consistent.
+
+During a join or leave handoff, there is a brief window where concurrent
+writes to the same key on different nodes can conflict. Conflicts are resolved
+by a monotonic clock: the write with the higher clock value wins. There are no
+locks or blocking during handoff — reads and writes continue to be served
+throughout.
 
 ## Configuration
 
@@ -117,9 +128,6 @@ itself.
 
 - **Hard crashes lose data.** If a node terminates without running `terminate/2`,
   the entries it owned are lost. Replication is not implemented.
-- **Brief race windows during membership changes.** Concurrent writes during
-  handoff may be overwritten by shipped older values. Gossip propagation delay
-  on leave may briefly route writes to the departing node.
 - **Handoff blocks the owner GenServer.** For large tables, handoff may exceed
   the default supervisor shutdown timeout. Increase the `shutdown:` value in
   the child spec if needed.

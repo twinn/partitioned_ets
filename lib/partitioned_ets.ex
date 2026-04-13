@@ -83,31 +83,40 @@ defmodule PartitionedEts do
   When the cluster membership changes, affected entries are physically
   transferred so that data and routing stay in sync:
 
-    * **Join** — when a new node joins `:pg`, every existing node sees
-      the `:join` event and iterates its local entries, ships the keys
-      whose new HRW shard lives on the joiner, and deletes them
-      locally. Runs inline in the owner GenServer's `handle_info` so
-      the user `node_added/1` callback fires *after* handoff has
-      completed on that node.
+    * **Join** — when a new node joins, every existing node iterates
+      its local entries, ships the keys whose new HRW shard lives on
+      the joiner, and deletes them locally.
 
-    * **Graceful leave** — when an owner GenServer shuts down with a
-      `:normal`/`:shutdown`/`{:shutdown, _}` reason, `terminate/2`
-      snapshots membership, leaves `:pg`, then ships every local entry
-      to the shard that owns it under the shard set excluding self.
+    * **Graceful leave** — when a node shuts down gracefully, it ships
+      all entries to their new owners before leaving the cluster. A
+      two-pass strategy ensures no read misses during the transfer:
+      entries are shipped while the node is still registered, then any
+      writes that arrived during the first pass are reconciled using
+      clock-based conflict resolution.
+
+  ## Consistency model
+
+  PartitionedEts is **eventually consistent** with **last-writer-wins**
+  semantics during topology changes. In steady state (no nodes joining
+  or leaving), every operation is immediately consistent — a write
+  followed by a read to the same key on any node returns the written
+  value.
+
+  During a join or leave handoff, there is a brief window where
+  concurrent writes to the same key on different nodes can conflict.
+  Conflicts are resolved by a monotonic clock: the write with the
+  higher clock value wins. In practice this means that writes routed
+  to the new owner after a topology change take precedence over stale
+  values being shipped from the old owner.
+
+  There are no locks or blocking during handoff — reads and writes
+  continue to be served throughout the transition.
 
   > #### Known limitations {: .info}
   >
   >   * **Hard crashes lose data.** If a node crashes without running
   >     `terminate/2`, the entries it owned are gone. Replication is
   >     a separate feature and not implemented here.
-  >
-  >   * **Brief race window during leave.** Leave handoff ships all
-  >     entries before leaving `:pg`, then does a second pass for any
-  >     writes that arrived during the first pass. The second pass uses
-  >     `insert_new` to avoid overwriting writes that went directly to
-  >     survivors. There is a small window between `:pg.leave` and
-  >     gossip propagating to peers where writes may still route to the
-  >     leaving node; these are captured by the second pass.
   >
   >   * **Handoff blocks the owner GenServer.** The iterate-and-ship
   >     work runs inline in `handle_info` (join) or `terminate`
@@ -136,24 +145,16 @@ defmodule PartitionedEts do
 
     * **Paginated ops** (`match/3`, `select/3`, `match_object/3`,
       `select_reverse/3`):
-      - The first call materializes the *full* cluster-wide result
-        set in memory (via unbounded fan-out), then hands out
-        `limit`-sized chunks. Subsequent `match/2` (continuation)
-        calls just walk the in-memory tail.
+      - The first call materializes the full cluster-wide result set
+        in memory (via unbounded fan-out), then hands out `limit`-sized
+        chunks. Subsequent continuation calls walk the in-memory tail.
       - This is wasteful for large result sets. A future improvement
-        will introduce per-node scan-session processes that hold `:ets`
-        continuations locally and stream chunks over `:erpc`.
+        will stream chunks using cross-node `:ets` continuations.
 
   Fan-out ops are O(total cluster shards) per call. For BEAM clusters
-  in the 2–20 node range (the common case) this is fine; at hundreds
+  in the 2--20 node range (the common case) this is fine; at hundreds
   of nodes the fan-out semantics do not scale regardless of
   implementation and the use case needs a different shape.
-
-  **Pagination** is in-memory for the reason noted above: `:ets`
-  continuations contain magic refs to compiled match-spec NIF
-  resources that are local to the originating VM and do not round-trip
-  cleanly via `:erpc`. Until the per-node scan-session process exists,
-  `match/3` and friends will materialize the full result set.
 
   ## When to use this library
 
@@ -176,7 +177,7 @@ defmodule PartitionedEts do
       `:ordered_set` or a database with ordering guarantees.
     * Result sets from `match`/`select` with a limit are large enough
       that in-memory pagination is not viable. A future streaming
-      pagination improvement will address this.
+      pagination improvement is planned.
     * The cluster has hundreds of nodes. Fan-out does not scale at
       that size; a purpose-built distributed key-value store is more
       appropriate.
@@ -470,41 +471,32 @@ defmodule PartitionedEts do
 
   def handle_info(_msg, state), do: {:noreply, state}
 
-  # ── Handoff (Phase 5) ────────────────────────────────────────────────
+  # ── Handoff ────────────────────────────────────────────────────────
   #
-  # When the cluster membership changes, HRW remaps `~1/total_shards`
-  # of keys to different shards. Without handoff, those keys are still
-  # physically present on the old owner's ETS tables but unreachable
-  # via the new routing. Handoff physically moves the affected entries
-  # to their new owners so the data and the routing stay in sync.
+  # When the cluster membership changes, HRW remaps ~1/total_shards
+  # of keys. Handoff physically moves the affected entries so data
+  # and routing stay in sync. Both halves run inline in the GenServer.
   #
-  # Both halves are best-effort and run inline in the GenServer:
+  # Join: existing nodes iterate local partitions, ship keys whose
+  # new HRW shard lives on the joiner via insert_new (avoids
+  # overwriting concurrent writes), delete locally on success.
   #
-  #   - Join handoff fires from `handle_info({_, :join, ...})` on every
-  #     existing node when a new node joins. Each existing node iterates
-  #     its local partitions, finds keys whose new HRW shard now lives
-  #     on the joiner, and ships them via `:erpc.call`.
+  # Leave (two-pass with clock-based conflict resolution):
+  #   1. Enter clock mode — an :atomics counter stamps every write
+  #      in a shadow table. Zero overhead in normal operation.
+  #   2. Pass 1: ship all entries via insert while still registered
+  #      (no read misses). Record {fingerprint, clock} metadata on
+  #      each destination.
+  #   3. Leave :pg, wait for local monitor confirmation.
+  #   4. Pass 2: ship only entries that changed during pass 1
+  #      (clock > pass1_clock). Destination uses clock-based
+  #      conflict resolution for :set tables and fingerprint-based
+  #      dedup for :bag/:duplicate_bag.
+  #   5. Exit clock mode, clean up metadata tables.
   #
-  #   - Leave handoff fires from `terminate/2` on the *graceful* exit
-  #     paths only (`:normal`, `:shutdown`, `{:shutdown, _}`). It leaves
-  #     `:pg` first so other nodes start to route around us, then ships
-  #     every local entry to its new owner under the shard set excluding
-  #     ourselves.
-  #
-  # Limitations (acknowledged, to be lifted later):
-  #
-  #   - Hard crashes (the leaving VM dies before terminate runs) still
-  #     lose the data on the crashed node. Replication is a separate
-  #     feature and not implemented.
-  #
-  #   - Join handoff uses `insert_new` so shipped entries never
-  #     overwrite concurrent writes at the destination.
-  #
-  #   - Leave handoff uses a two-pass strategy: pass 1 ships all
-  #     entries via `insert` while still registered (no read misses),
-  #     then leaves :pg, waits for the local :pg monitor confirmation,
-  #     and does pass 2 via `insert_new` to catch writes that arrived
-  #     during pass 1 without clobbering direct writes to survivors.
+  # All cross-node handoff calls go through a versioned protocol
+  # (__receive_handoff__/1) so newer nodes can handle older nodes'
+  # messages during rolling deploys.
 
   defp do_join_handoff(%{name: name}, joiner_node) do
     cfg = :persistent_term.get({__MODULE__, name, :config})
@@ -1277,23 +1269,13 @@ defmodule PartitionedEts do
 
   # ── Paginated scans (match/3, select/3, …) ───────────────────────────
   #
-  # Phase 3 limitation: rather than streaming chunks via `:ets`
-  # continuations across nodes (which doesn't actually work — the
-  # internal magic refs in an `:ets` continuation point to compiled
-  # match-spec resources that are local to the originating VM and
-  # round-trip incorrectly via :erpc), we materialize the full result
-  # set on the first call by fanning out unbounded across all shards,
-  # then paginate the in-memory list.
+  # Currently materializes the full cluster-wide result set on the
+  # first call, then paginates the in-memory list. The continuation
+  # tuple is opaque: {:continue, fun, spec, limit, leftover}.
   #
-  # The continuation tuple shape is opaque to callers but holds:
-  #
-  #   {:continue, fun, spec, limit, leftover}
-  #
-  # where `leftover` is the unread tail of the materialized result
-  # list. This is wasteful for large tables — Phase 4/5 will introduce
-  # per-node scan-session processes that hold the `:ets` continuation
-  # locally and stream chunks back, sidestepping the cross-node refs
-  # problem.
+  # ETS continuations do survive distribution (verified by cross-node
+  # tests), so a future improvement can stream chunks directly using
+  # :ets continuations over :erpc without full materialization.
 
   defp start_paginated(table, fun, spec, limit, direction) do
     full_args =
