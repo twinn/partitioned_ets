@@ -55,7 +55,9 @@ defmodule PartitionedEts.Cluster do
   end
 
   defp inet_loader_args do
-    to_charlist("-loader inet -hosts 127.0.0.1 -setcookie #{:erlang.get_cookie()} -kernel prevent_overlapping_partitions false")
+    to_charlist(
+      "-loader inet -hosts 127.0.0.1 -setcookie #{:erlang.get_cookie()} -kernel prevent_overlapping_partitions false"
+    )
   end
 
   defp allow_boot(host) do
