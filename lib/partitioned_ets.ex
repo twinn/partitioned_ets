@@ -231,6 +231,8 @@ defmodule PartitionedEts do
 
   defstruct [:name, :callbacks, :monitor_ref]
 
+  @handoff_version 1
+
   defguardp is_continuation(value) when is_tuple(value) and elem(value, 0) == :continue
 
   # ── Lifecycle ────────────────────────────────────────────────────────
@@ -588,38 +590,34 @@ defmodule PartitionedEts do
 
   defp create_meta_tables(name, shards) do
     nodes = shards |> Enum.map(fn {n, _} -> n end) |> Enum.uniq()
+    Map.new(nodes, &create_meta_table(name, &1))
+  end
 
-    Map.new(nodes, fn node ->
-      meta_name = :"#{name}_handoff_meta_#{:erlang.unique_integer([:positive])}"
+  defp create_meta_table(name, target_node) do
+    meta_name = :"#{name}_handoff_meta_#{:erlang.unique_integer([:positive])}"
 
-      if node == node() do
-        table = :ets.new(meta_name, [:set, :public])
-        {node, table}
-      else
-        try do
-          table = :erpc.call(node, :ets, :new, [meta_name, [:set, :public]])
-          {node, table}
-        rescue
-          _ -> {node, nil}
-        end
+    if target_node == node() do
+      {target_node, :ets.new(meta_name, [:set, :public])}
+    else
+      case send_handoff(target_node, %{version: @handoff_version, op: :create_meta_table, name: meta_name}) do
+        {:ok, table} -> {target_node, table}
+        _ -> {target_node, nil}
       end
-    end)
+    end
   end
 
   defp cleanup_meta_tables(meta_tables) do
-    Enum.each(meta_tables, fn {node, table} ->
-      if table do
-        try do
-          if node == node() do
-            :ets.delete(table)
-          else
-            :erpc.call(node, :ets, :delete, [table])
-          end
-        rescue
-          _ -> :ok
-        end
-      end
-    end)
+    Enum.each(meta_tables, &cleanup_meta_table/1)
+  end
+
+  defp cleanup_meta_table({_target_node, nil}), do: :ok
+
+  defp cleanup_meta_table({target_node, table}) do
+    if target_node == node() do
+      :ets.delete(table)
+    else
+      send_handoff(target_node, %{version: @handoff_version, op: :delete_table, table: table})
+    end
   end
 
   # Pass 1: ship all entries via insert, record metadata with clock
@@ -654,39 +652,37 @@ defmodule PartitionedEts do
     if target_node == node() do
       :ets.insert(meta_table, entry)
     else
-      try do
-        :erpc.call(target_node, :ets, :insert, [meta_table, entry])
-      rescue
-        _ -> :ok
-      end
+      send_handoff(target_node, %{version: @handoff_version, op: :record_meta, meta_table: meta_table, entry: entry})
     end
+
+    :ok
   end
 
   # Pass 2: only ship entries that changed during pass 1
   defp ship_pass2(shadow, pass1_clock, partition_tables, shards, hash_module, meta_tables, _cfg) do
-    changed = PartitionedEts.Handoff.changed_since(shadow, pass1_clock)
-    changed_map = Map.new(changed)
+    changed_map =
+      shadow
+      |> PartitionedEts.Handoff.changed_since(pass1_clock)
+      |> Map.new()
 
     Enum.each(partition_tables, fn local_pt ->
-      :ets.foldl(
-        fn obj, :ok ->
-          key = elem(obj, 0)
-
-          case Map.fetch(changed_map, key) do
-            {:ok, clock} ->
-              {target_node, target_pt} = hash_module.hash(key, shards)
-              clock_ship(target_node, target_pt, obj, Map.get(meta_tables, target_node), clock)
-
-            :error ->
-              :ok
-          end
-
-          :ok
-        end,
-        :ok,
-        local_pt
-      )
+      :ets.foldl(&ship_changed(&1, &2, changed_map, shards, hash_module, meta_tables), :ok, local_pt)
     end)
+  end
+
+  defp ship_changed(obj, :ok, changed_map, shards, hash_module, meta_tables) do
+    key = elem(obj, 0)
+
+    case Map.fetch(changed_map, key) do
+      {:ok, clock} ->
+        {target_node, target_pt} = hash_module.hash(key, shards)
+        clock_ship(target_node, target_pt, obj, Map.get(meta_tables, target_node), clock)
+
+      :error ->
+        :ok
+    end
+
+    :ok
   end
 
   defp clock_ship(_target_node, _target_pt, _obj, nil, _clock), do: :ok
@@ -695,17 +691,70 @@ defmodule PartitionedEts do
     if target_node == node() do
       PartitionedEts.Handoff.clock_insert(target_pt, meta_table, obj, clock)
     else
-      try do
-        :erpc.call(target_node, __MODULE__, :__remote_clock_insert__, [target_pt, meta_table, obj, clock])
-      rescue
-        _ -> :ok
-      end
+      send_handoff(target_node, %{
+        version: @handoff_version,
+        op: :clock_insert,
+        table: target_pt,
+        meta_table: meta_table,
+        obj: obj,
+        clock: clock
+      })
     end
+
+    :ok
   end
 
+  # ── Versioned handoff protocol ──────────────────────────────────────
+  #
+  # All cross-node handoff operations go through __receive_handoff__/1.
+  # The message is a map with a :version key so newer nodes can handle
+  # older nodes' messages during rolling deploys.
+
   @doc false
-  def __remote_clock_insert__(target_pt, meta_table, obj, clock) do
-    PartitionedEts.Handoff.clock_insert(target_pt, meta_table, obj, clock)
+  def __receive_handoff__(%{version: 1, op: :insert, table: table, obj: obj}) do
+    :ets.insert(table, obj)
+    :ok
+  end
+
+  def __receive_handoff__(%{version: 1, op: :insert_new, table: table, obj: obj}) do
+    :ets.insert_new(table, obj)
+    :ok
+  end
+
+  def __receive_handoff__(%{version: 1, op: :clock_insert, table: table, meta_table: meta_table, obj: obj, clock: clock}) do
+    PartitionedEts.Handoff.clock_insert(table, meta_table, obj, clock)
+  end
+
+  def __receive_handoff__(%{version: 1, op: :record_meta, meta_table: meta_table, entry: entry}) do
+    :ets.insert(meta_table, entry)
+    :ok
+  end
+
+  def __receive_handoff__(%{version: 1, op: :create_meta_table, name: name}) do
+    {:ok, :ets.new(name, [:set, :public])}
+  end
+
+  def __receive_handoff__(%{version: 1, op: :delete_table, table: table}) do
+    :ets.delete(table)
+    :ok
+  end
+
+  def __receive_handoff__(%{version: v} = msg) when v > @handoff_version do
+    # Future version we don't understand. Log and ignore so rolling
+    # deploys don't crash the older node.
+    require Logger
+
+    Logger.warning(
+      "PartitionedEts: received handoff version #{v}, max supported is #{@handoff_version}. Ignoring: #{inspect(msg)}"
+    )
+
+    {:error, :unsupported_version}
+  end
+
+  defp send_handoff(target_node, msg) do
+    :erpc.call(target_node, __MODULE__, :__receive_handoff__, [msg])
+  rescue
+    _ -> {:error, :erpc_failed}
   end
 
   defp ship_entry(target_node, target_table, obj, insert_fn) do
@@ -713,12 +762,7 @@ defmodule PartitionedEts do
       apply(:ets, insert_fn, [target_table, obj])
       :ok
     else
-      try do
-        :erpc.call(target_node, :ets, insert_fn, [target_table, obj])
-        :ok
-      rescue
-        _e -> {:error, :erpc_failed}
-      end
+      send_handoff(target_node, %{version: @handoff_version, op: insert_fn, table: target_table, obj: obj})
     end
   end
 
