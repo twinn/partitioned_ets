@@ -5,9 +5,8 @@ defmodule PartitionedEts do
   `PartitionedEts` exposes the same API surface as `:ets`, but routes each
   operation to a single shard chosen by [rendezvous hashing
   (HRW)](https://en.wikipedia.org/wiki/Rendezvous_hashing) over the
-  cluster's `(node, partition)` shard space. The canonical API is
-  module-shaped: every function takes the table name as its first
-  argument, mirroring `:ets` exactly.
+  cluster's `(node, partition)` shard space. Every function takes the
+  table name as its first argument, mirroring `:ets`.
 
       children = [
         {PartitionedEts,
@@ -37,11 +36,10 @@ defmodule PartitionedEts do
   and call `:ets` either locally or via `:erpc` to the owning node.
   The GenServer is off the hot path.
 
-  `:pg` (Erlang's process-group module) carries cluster membership.
-  Every owner GenServer calls `:pg.monitor/2` on its own group in
-  `init/1` so it can react to join/leave events with handoff; the
-  membership view itself is just `:pg.get_members/2`, read lock-free
-  from the calling process on every routing call.
+  `PgRegistry` carries cluster membership. Each owner GenServer
+  registers with its partition table names as metadata, enabling
+  heterogeneous partition counts across the cluster. The membership
+  view is read lock-free from ETS on every routing call.
 
   ## Partitions
 
@@ -54,24 +52,16 @@ defmodule PartitionedEts do
   usually fine; for contended writes `System.schedulers_online()` is
   a reasonable starting point.
 
-  All nodes hosting the same logical table must currently use the
-  same `:partitions` value — heterogeneous per-node partition counts
-  are a future improvement.
+  Nodes hosting the same logical table may use different `:partitions`
+  values. Each node's partition layout is advertised via PgRegistry
+  metadata, so routing always uses the correct shard set.
 
   ## Routing
 
-  Every key-based operation picks the single shard whose HRW weight
-  is highest:
-
-      hash(key, shards) =
-        Enum.max_by(shards, fn shard -> :erlang.phash2({key, shard}) end)
-
-  HRW has the property that **adding or removing one shard remaps
-  only `~1/total_shards` of keys**; all other keys keep the same
-  shard. This is the foundation of the handoff work: a single node
-  joining or leaving only requires moving a small slice of the data,
-  not the whole table. With modulo hashing (`phash2(key, N)`), by
-  contrast, adding one node would remap almost every key.
+  The default routing uses [rendezvous hashing
+  (HRW)](https://en.wikipedia.org/wiki/Rendezvous_hashing), which
+  minimizes key movement when the shard set changes — adding or
+  removing a node remaps only ~1/total_shards of keys.
 
   Override routing by passing a `:callbacks` module to `start_link/1`
   that exports `hash/2`, or by defining `hash/2` on a `use
@@ -80,35 +70,43 @@ defmodule PartitionedEts do
 
   ## Handoff
 
-  When the cluster membership changes, affected entries are physically
-  transferred so that data and routing stay in sync:
+  When the cluster membership changes, affected entries are transferred
+  between nodes so that data and routing stay in sync:
 
-    * **Join** — when a new node joins `:pg`, every existing node sees
-      the `:join` event and iterates its local entries, ships the keys
-      whose new HRW shard lives on the joiner, and deletes them
-      locally. Runs inline in the owner GenServer's `handle_info` so
-      the user `node_added/1` callback fires *after* handoff has
-      completed on that node.
+    * **Join** — when a new node joins, every existing node iterates
+      its local entries, ships the keys whose new HRW shard lives on
+      the joiner, and deletes them locally.
 
-    * **Graceful leave** — when an owner GenServer shuts down with a
-      `:normal`/`:shutdown`/`{:shutdown, _}` reason, `terminate/2`
-      snapshots membership, leaves `:pg`, then ships every local entry
-      to the shard that owns it under the shard set excluding self.
+    * **Graceful leave** — when a node shuts down gracefully, it ships
+      all entries to their new owners before leaving the cluster. A
+      two-pass strategy ensures no read misses during the transfer:
+      entries are shipped while the node is still registered, then any
+      writes that arrived during the first pass are reconciled using
+      clock-based conflict resolution.
+
+  ## Consistency model
+
+  PartitionedEts is **eventually consistent** with **last-writer-wins**
+  semantics during topology changes. In steady state (no nodes joining
+  or leaving), every operation is immediately consistent — a write
+  followed by a read to the same key on any node returns the written
+  value.
+
+  During a join or leave handoff, there is a brief window where
+  concurrent writes to the same key on different nodes can conflict.
+  Conflicts are resolved by a monotonic clock: the write with the
+  higher clock value wins. In practice this means that writes routed
+  to the new owner after a topology change take precedence over stale
+  values being shipped from the old owner.
+
+  There are no locks or blocking during handoff — reads and writes
+  continue to be served throughout the transition.
 
   > #### Known limitations {: .info}
   >
   >   * **Hard crashes lose data.** If a node crashes without running
   >     `terminate/2`, the entries it owned are gone. Replication is
   >     a separate feature and not implemented here.
-  >
-  >   * **Brief race windows during membership changes.** During a
-  >     join, writes arriving at the new node concurrent with handoff
-  >     may be overwritten by the shipped older value. During a leave,
-  >     the moment between `:pg.leave` and gossip propagating to
-  >     peers may briefly route writes to the leaving node. These are
-  >     the same race windows stagehand documents on its equivalent
-  >     leave path; closing them requires symmetric sync-blocking on
-  >     the destination, which is a future improvement.
   >
   >   * **Handoff blocks the owner GenServer.** The iterate-and-ship
   >     work runs inline in `handle_info` (join) or `terminate`
@@ -137,58 +135,48 @@ defmodule PartitionedEts do
 
     * **Paginated ops** (`match/3`, `select/3`, `match_object/3`,
       `select_reverse/3`):
-      - The first call materializes the *full* cluster-wide result
-        set in memory (via unbounded fan-out), then hands out
-        `limit`-sized chunks. Subsequent `match/2` (continuation)
-        calls just walk the in-memory tail.
-      - This is wasteful for large result sets; the right fix is
-        per-node scan-session processes that hold `:ets` continuations
-        locally and stream chunks over `:erpc`, which is on the
-        roadmap.
+      - The first call materializes the full cluster-wide result set
+        in memory (via unbounded fan-out), then hands out `limit`-sized
+        chunks. Subsequent continuation calls walk the in-memory tail.
+      - This is wasteful for large result sets. A future improvement
+        will stream chunks using cross-node `:ets` continuations.
 
   Fan-out ops are O(total cluster shards) per call. For BEAM clusters
-  in the 2–20 node range (the common case) this is fine; at hundreds
-  of nodes the fan-out semantics don't scale regardless of
+  in the 2--20 node range (the common case) this is fine; at hundreds
+  of nodes the fan-out semantics do not scale regardless of
   implementation and the use case needs a different shape.
 
-  **Pagination** is in-memory for the reason noted above: `:ets`
-  continuations contain magic refs to compiled match-spec NIF
-  resources that are local to the originating VM and don't round-trip
-  cleanly via `:erpc`. Until the per-node scan-session process exists,
-  `match/3` and friends will materialize the full result set.
+  ## When to use this library
 
-  ## When to reach for this
+  **Good fit:**
 
-  **Good fit**:
+    * An `:ets` table that needs to span a small BEAM cluster
+      (typically 2--20 nodes).
+    * The full `:ets` API surface is required (match specs, pagination,
+      `foldl/3`, `update_counter/3`), not only `get`/`put`.
+    * Automatic rebalancing on graceful membership changes is desired.
+    * Multi-partition write-contention relief on each node is needed
+      (including single-node deployments).
+    * Loss of data on hard crashes is acceptable (cache semantics).
 
-    * You have an `:ets` table that's growing past one node's comfort
-      zone and you want to spread it across a small BEAM cluster
-      (say, 2–20 nodes).
-    * You need the `:ets` API surface (match specs, pagination, foldl,
-      update_counter) — not just `get`/`put`.
-    * You want automatic rebalancing on graceful membership changes.
-    * You want multi-partition write-contention relief on each node
-      (even on a single-node deployment).
-    * Cache semantics for crashes are acceptable.
+  **Poor fit:**
 
-  **Bad fit**:
-
-    * You need replication or survival across hard crashes. Use
+    * Replication or survival across hard crashes is required. Use
       Mnesia, Khepri, or a CP database.
-    * You need cluster-wide ordered iteration. Use a single-node
-      `:ordered_set` or a real database.
-    * Your result sets from `match`/`select` with a limit are large
-      enough that in-memory pagination is a dealbreaker. Wait for the
-      streaming-pagination improvement, or use a database.
-    * You're at hundreds of nodes. Fan-out doesn't scale; pick a
-      different shape (a proper distributed KV like Riak).
+    * Cluster-wide ordered iteration is needed. Use a single-node
+      `:ordered_set` or a database with ordering guarantees.
+    * Result sets from `match`/`select` with a limit are large enough
+      that in-memory pagination is not viable. A future streaming
+      pagination improvement is planned.
+    * The cluster has hundreds of nodes. Fan-out does not scale at
+      that size; a purpose-built distributed key-value store is more
+      appropriate.
 
   ## `use` macro
 
-  An optional `use PartitionedEts, table_opts: [...], partitions: N`
-  macro generates a one-module-per-table wrapper for users who prefer
-  that style. The generated functions delegate to the canonical module
-  API:
+  The `use PartitionedEts, table_opts: [...], partitions: N` macro
+  generates a one-module-per-table wrapper. The generated functions
+  delegate to the module-level API:
 
       defmodule MyApp.Cache do
         use PartitionedEts, table_opts: [:named_table, :public], partitions: 16
@@ -204,6 +192,7 @@ defmodule PartitionedEts do
 
   use GenServer
 
+  alias PartitionedEts.Handoff
   alias PartitionedEts.Registry
 
   @typedoc """
@@ -302,6 +291,11 @@ defmodule PartitionedEts do
       macro form, the using module *is* the callbacks module and the
       generated defaults are marked `defoverridable`.
 
+    * `:distributed` — boolean, optional, default `true`. When `false`,
+      the table runs on a single node with no cluster registration or
+      handoff. Useful for write-contention relief via partitioning
+      without distribution overhead.
+
   ## Examples
 
       # Simple module-form
@@ -331,14 +325,24 @@ defmodule PartitionedEts do
     table_opts = opts |> Keyword.fetch!(:table_opts) |> List.wrap()
     partitions = Keyword.get(opts, :partitions, 1)
     callbacks = Keyword.get(opts, :callbacks)
+    distributed = Keyword.get(opts, :distributed, true)
 
     validate_table_opts!(table_opts)
     validate_partitions!(partitions)
 
+    partition_tables = build_partition_tables(name, partitions)
+
+    via =
+      if distributed do
+        {:via, PgRegistry, {Registry.scope(), name, %{partition_tables: partition_tables}}}
+      else
+        {:via, Elixir.Registry, {PartitionedEts.LocalRegistry, name}}
+      end
+
     GenServer.start_link(
       __MODULE__,
-      {name, table_opts, partitions, callbacks},
-      name: {:via, Registry, name}
+      {name, table_opts, partition_tables, callbacks, distributed},
+      name: via
     )
   end
 
@@ -372,14 +376,12 @@ defmodule PartitionedEts do
   # ── GenServer callbacks ──────────────────────────────────────────────
 
   @impl GenServer
-  def init({name, table_opts, partitions, callbacks}) do
+  def init({name, table_opts, partition_tables, callbacks, distributed}) do
     # Trap exits so terminate/2 runs on graceful shutdown (e.g. from
     # a supervisor sending a :shutdown signal). Without this, the
     # process exits immediately on any EXIT signal and the leave
     # handoff never fires.
     Process.flag(:trap_exit, true)
-
-    partition_tables = build_partition_tables(name, partitions)
 
     Enum.each(partition_tables, fn pt ->
       :ets.new(pt, table_opts)
@@ -392,17 +394,25 @@ defmodule PartitionedEts do
         do: callbacks,
         else: __MODULE__
 
+    clock_ref = :atomics.new(1, [])
+    shadow_name = :"#{name}_handoff_shadow"
+
     config = %{
-      partition_count: partitions,
+      partition_count: length(partition_tables),
       partition_tables: List.to_tuple(partition_tables),
-      hash: hash_module
+      hash: hash_module,
+      clock_ref: clock_ref,
+      shadow_name: shadow_name,
+      distributed: distributed
     }
 
     :persistent_term.put({__MODULE__, name, :config}, config)
 
-    # Monitor only this table's group; raw :pg.monitor avoids the
-    # cluster-wide event fan-out from monitor_scope/1.
-    {monitor_ref, _initial_pids} = :pg.monitor(Registry, name)
+    monitor_ref =
+      if distributed do
+        {ref, _initial_members} = Registry.monitor(name)
+        ref
+      end
 
     {:ok,
      %__MODULE__{
@@ -420,7 +430,10 @@ defmodule PartitionedEts do
 
   @impl GenServer
   def terminate(reason, %{name: name} = state) do
-    if graceful_shutdown?(reason) do
+    cfg = :persistent_term.get({__MODULE__, name, :config}, nil)
+    distributed? = cfg != nil and cfg.distributed
+
+    if graceful_shutdown?(reason) and distributed? do
       do_leave_handoff(state)
     end
 
@@ -434,8 +447,8 @@ defmodule PartitionedEts do
   defp graceful_shutdown?(_), do: false
 
   @impl GenServer
-  def handle_info({ref, :join, group, pids}, %{monitor_ref: ref, name: group, callbacks: callbacks} = state) do
-    joiner_node = pids |> hd() |> :erlang.node()
+  def handle_info({ref, :join, group, entries}, %{monitor_ref: ref, name: group, callbacks: callbacks} = state) do
+    joiner_node = entries |> hd() |> elem(0) |> :erlang.node()
 
     # Run join handoff first so the user-visible node_added callback
     # only fires once data has been moved to the new node. We skip the
@@ -455,9 +468,9 @@ defmodule PartitionedEts do
     {:noreply, state}
   end
 
-  def handle_info({ref, :leave, group, pids}, %{monitor_ref: ref, name: group, callbacks: callbacks} = state) do
+  def handle_info({ref, :leave, group, entries}, %{monitor_ref: ref, name: group, callbacks: callbacks} = state) do
     if callbacks && function_exported?(callbacks, :node_removed, 1) do
-      node = pids |> hd() |> :erlang.node()
+      node = entries |> hd() |> elem(0) |> :erlang.node()
       Task.start(fn -> callbacks.node_removed(node) end)
     end
 
@@ -466,128 +479,44 @@ defmodule PartitionedEts do
 
   def handle_info(_msg, state), do: {:noreply, state}
 
-  # ── Handoff (Phase 5) ────────────────────────────────────────────────
+  # ── Handoff ────────────────────────────────────────────────────────
   #
-  # When the cluster membership changes, HRW remaps `~1/total_shards`
-  # of keys to different shards. Without handoff, those keys are still
-  # physically present on the old owner's ETS tables but unreachable
-  # via the new routing. Handoff physically moves the affected entries
-  # to their new owners so the data and the routing stay in sync.
+  # When the cluster membership changes, HRW remaps ~1/total_shards
+  # of keys. Handoff moves the affected entries so data
+  # and routing stay in sync. Both halves run inline in the GenServer.
   #
-  # Both halves are best-effort and run inline in the GenServer:
+  # Join: existing nodes iterate local partitions, ship keys whose
+  # new HRW shard lives on the joiner via insert_new (avoids
+  # overwriting concurrent writes), delete locally on success.
   #
-  #   - Join handoff fires from `handle_info({_, :join, ...})` on every
-  #     existing node when a new node joins. Each existing node iterates
-  #     its local partitions, finds keys whose new HRW shard now lives
-  #     on the joiner, and ships them via `:erpc.call`.
+  # Leave (two-pass with clock-based conflict resolution):
+  #   1. Enter clock mode — an :atomics counter stamps every write
+  #      in a shadow table. Zero overhead in normal operation.
+  #   2. Pass 1: ship all entries via insert while still registered
+  #      (no read misses). Record {fingerprint, clock} metadata on
+  #      each destination.
+  #   3. Leave :pg, wait for local monitor confirmation.
+  #   4. Pass 2: ship only entries that changed during pass 1
+  #      (clock > pass1_clock). Destination uses clock-based
+  #      conflict resolution for :set tables and fingerprint-based
+  #      dedup for :bag/:duplicate_bag.
+  #   5. Exit clock mode, clean up metadata tables.
   #
-  #   - Leave handoff fires from `terminate/2` on the *graceful* exit
-  #     paths only (`:normal`, `:shutdown`, `{:shutdown, _}`). It leaves
-  #     `:pg` first so other nodes start to route around us, then ships
-  #     every local entry to its new owner under the shard set excluding
-  #     ourselves.
-  #
-  # Limitations (acknowledged, to be lifted later):
-  #
-  #   - Hard crashes (the leaving VM dies before terminate runs) still
-  #     lose the data on the crashed node. Replication is a separate
-  #     feature and not implemented.
-  #
-  #   - There is a brief race window during a join where the joining
-  #     node sees writes from other nodes for keys we are still in the
-  #     middle of shipping. The "ours" version may overwrite the
-  #     "theirs" version. Symmetric sync-blocking on the destination
-  #     would close this window and is a Phase 6+ improvement.
-  #
-  #   - There is a brief race window during a leave between calling
-  #     `:pg.leave` and the gossip propagating to other nodes; remote
-  #     writes that hash to us during that window land on a table that
-  #     is about to be destroyed. Stagehand has the same window and
-  #     documents it the same way.
+  # All cross-node handoff calls go through a versioned protocol
+  # (__receive_handoff__/1) so newer nodes can handle older nodes'
+  # messages during rolling deploys.
 
   defp do_join_handoff(%{name: name}, joiner_node) do
     cfg = :persistent_term.get({__MODULE__, name, :config})
     current_shards = shards(name, :forward)
     partition_tables = Tuple.to_list(cfg.partition_tables)
-
-    Enum.each(partition_tables, fn local_pt ->
-      handoff_partition_to_joiner(local_pt, joiner_node, current_shards, cfg.hash)
-    end)
+    Handoff.join(partition_tables, joiner_node, current_shards, cfg.hash)
   end
 
-  defp handoff_partition_to_joiner(local_pt, joiner_node, current_shards, hash_module) do
-    to_move =
-      :ets.foldl(
-        &collect_if_owned_by(&1, &2, joiner_node, current_shards, hash_module),
-        [],
-        local_pt
-      )
-
-    Enum.each(to_move, fn {key, obj, target_pt} ->
-      case ship_entry(joiner_node, target_pt, obj) do
-        :ok -> :ets.delete(local_pt, key)
-        {:error, _} -> :ok
-      end
-    end)
-  end
-
-  defp collect_if_owned_by(obj, acc, target_node, shards, hash_module) do
-    key = elem(obj, 0)
-    {owner_node, target_pt} = hash_module.hash(key, shards)
-
-    if owner_node == target_node do
-      [{key, obj, target_pt} | acc]
-    else
-      acc
-    end
-  end
-
-  defp do_leave_handoff(%{name: name}) do
-    current_node = node()
-    current_shards = shards(name, :forward)
-    new_shards = Enum.reject(current_shards, fn {n, _} -> n == current_node end)
-
-    if new_shards != [] do
-      drain_local_to(name, new_shards)
-    end
-
-    :ok
-  end
-
-  defp drain_local_to(name, new_shards) do
-    # Leave :pg before shipping so other nodes start routing around
-    # us. There is a brief window where the gossip hasn't propagated
-    # yet — accepted, see the comment above.
-    Registry.unregister_name(name)
-
+  defp do_leave_handoff(%{name: name, monitor_ref: ref}) do
     cfg = :persistent_term.get({__MODULE__, name, :config})
-    hash_module = cfg.hash
-    partition_tables = Tuple.to_list(cfg.partition_tables)
-
-    Enum.each(partition_tables, fn local_pt ->
-      :ets.foldl(&ship_each(&1, &2, new_shards, hash_module), :ok, local_pt)
-    end)
-  end
-
-  defp ship_each(obj, _acc, shards, hash_module) do
-    key = elem(obj, 0)
-    {target_node, target_pt} = hash_module.hash(key, shards)
-    ship_entry(target_node, target_pt, obj)
-    :ok
-  end
-
-  defp ship_entry(target_node, target_table, obj) do
-    if target_node == node() do
-      :ets.insert(target_table, obj)
-      :ok
-    else
-      try do
-        :erpc.call(target_node, :ets, :insert, [target_table, obj])
-        :ok
-      rescue
-        e -> {:error, e}
-      end
-    end
+    current_shards = shards(name, :forward)
+    Handoff.leave(name, ref, current_shards, cfg)
   end
 
   # ── Default hash ─────────────────────────────────────────────────────
@@ -657,6 +586,7 @@ defmodule PartitionedEts do
   @spec lookup(atom(), term()) :: [tuple()]
   def lookup(table, key), do: partitioned_call(table, key, :lookup, [table, key])
 
+  @doc "See `:ets.insert_new/2`. Routes each object to the shard owning its key."
   @spec insert_new(atom(), tuple() | [tuple()]) :: boolean()
   def insert_new(table, objects) when is_list(objects) do
     Enum.all?(objects, &insert_new(table, &1))
@@ -666,18 +596,23 @@ defmodule PartitionedEts do
     partitioned_call(table, elem(object, 0), :insert_new, [table, object])
   end
 
+  @doc "See `:ets.member/2`. Single-shard call, routes via HRW."
   @spec member(atom(), term()) :: boolean()
   def member(table, key), do: partitioned_call(table, key, :member, [table, key])
 
+  @doc "See `:ets.delete/2`. Single-shard call, routes via HRW."
   @spec delete(atom(), term()) :: true
   def delete(table, key), do: partitioned_call(table, key, :delete, [table, key])
 
+  @doc "See `:ets.delete_object/2`. Single-shard call, routes via HRW."
   @spec delete_object(atom(), tuple()) :: true
   def delete_object(table, obj), do: partitioned_call(table, elem(obj, 0), :delete_object, [table, obj])
 
+  @doc "See `:ets.delete_all_objects/1`. Fans out across every shard in the cluster."
   @spec delete_all_objects(atom()) :: true
   def delete_all_objects(table), do: all_call(table, :delete_all_objects, [table])
 
+  @doc "See `:ets.lookup_element/3`. Single-shard call, routes via HRW."
   @spec lookup_element(atom(), term(), pos_integer()) :: term() | [term()]
   def lookup_element(table, key, pos), do: partitioned_call(table, key, :lookup_element, [table, key, pos])
 
@@ -700,13 +635,12 @@ defmodule PartitionedEts do
   @doc """
   See `:ets.match/3`.
 
-  Phase 3 simplification: this call materializes the *full*
-  cluster-wide result set in memory via an unbounded fan-out, then
-  returns the first `limit` entries along with an opaque continuation
-  that carries the remaining in-memory tail. Subsequent `match/2`
-  calls walk the tail. Wasteful for large result sets; see the
-  "Performance" section of the module docs for background and the
-  roadmap for the eventual streaming fix.
+  Materializes the full cluster-wide result set in memory via an
+  unbounded fan-out, then returns the first `limit` entries along with
+  an opaque continuation carrying the remaining in-memory tail.
+  Subsequent `match/2` calls walk the tail. This approach is not
+  efficient for large result sets; see the "Performance" section of the
+  module documentation for details.
   """
   @spec match(atom(), :ets.match_pattern(), pos_integer()) ::
           {[term()], continuation()} | :"$end_of_table"
@@ -714,6 +648,13 @@ defmodule PartitionedEts do
     start_paginated(table, :match, spec, limit, :forward)
   end
 
+  @doc """
+  See `:ets.select/2` and `:ets.select/1`.
+
+  When given a match spec, fans out across every shard and concatenates
+  results. When given a continuation token from `select/3`, resumes the
+  in-memory paginated walk.
+  """
   @spec select(atom(), :ets.match_spec() | continuation()) ::
           [term()] | {[term()], continuation()} | :"$end_of_table"
   def select(table, continuation) when is_continuation(continuation) do
@@ -722,15 +663,18 @@ defmodule PartitionedEts do
 
   def select(table, spec), do: all_call(table, :select, [table, spec])
 
+  @doc "See `:ets.select/3`. Same in-memory pagination approach as `match/3`."
   @spec select(atom(), :ets.match_spec(), pos_integer()) ::
           {[term()], continuation()} | :"$end_of_table"
   def select(table, spec, limit) do
     start_paginated(table, :select, spec, limit, :forward)
   end
 
+  @doc "See `:ets.select_count/2`. Fans out across every shard and sums the counts."
   @spec select_count(atom(), :ets.match_spec()) :: non_neg_integer()
   def select_count(table, spec), do: all_call(table, :select_count, [table, spec])
 
+  @doc "See `:ets.tab2list/1`. Fans out across every shard and concatenates results."
   @spec tab2list(atom()) :: [tuple()]
   def tab2list(table), do: all_call(table, :tab2list, [table])
 
@@ -784,10 +728,10 @@ defmodule PartitionedEts do
 
   Folds across every shard in the cluster in deterministic
   node-then-partition order. The fold function runs locally on each
-  shard's owning node via `:erpc`, so it must be available there
-  — typically via a `&Module.fun/2` reference (anonymous closures
-  only exist on the calling node and will raise `UndefinedFunctionError`
-  when reached on a remote shard).
+  shard's owning node via `:erpc` and must therefore be available on
+  that node. Use a `&Module.fun/2` capture rather than an anonymous
+  function, as anonymous closures exist only on the calling node and
+  will raise `UndefinedFunctionError` on remote shards.
   """
   @spec foldl(atom(), (term(), term() -> term()), term()) :: term()
   def foldl(table, fun, acc), do: fold_shards(shards(table, :forward), :foldl, fun, acc)
@@ -798,9 +742,17 @@ defmodule PartitionedEts do
   @spec foldr(atom(), (term(), term() -> term()), term()) :: term()
   def foldr(table, fun, acc), do: fold_shards(shards(table, :reverse), :foldr, fun, acc)
 
+  @doc "See `:ets.match_delete/2`. Fans out across every shard in the cluster."
   @spec match_delete(atom(), :ets.match_pattern()) :: true
   def match_delete(table, spec), do: all_call(table, :match_delete, [table, spec])
 
+  @doc """
+  See `:ets.match_object/2` and `:ets.match_object/1`.
+
+  When given a match pattern, fans out across every shard and concatenates
+  results. When given a continuation token from `match_object/3`, resumes
+  the in-memory paginated walk.
+  """
   @spec match_object(atom(), :ets.match_pattern() | continuation()) ::
           [tuple()] | {[tuple()], continuation()} | :"$end_of_table"
   def match_object(table, continuation) when is_continuation(continuation) do
@@ -809,15 +761,24 @@ defmodule PartitionedEts do
 
   def match_object(table, spec), do: all_call(table, :match_object, [table, spec])
 
+  @doc "See `:ets.match_object/3`. Same in-memory pagination approach as `match/3`."
   @spec match_object(atom(), :ets.match_pattern(), pos_integer()) ::
           {[tuple()], continuation()} | :"$end_of_table"
   def match_object(table, spec, limit) do
     start_paginated(table, :match_object, spec, limit, :forward)
   end
 
+  @doc "See `:ets.select_delete/2`. Fans out across every shard and sums the counts."
   @spec select_delete(atom(), :ets.match_spec()) :: non_neg_integer()
   def select_delete(table, spec), do: all_call(table, :select_delete, [table, spec])
 
+  @doc """
+  See `:ets.select_reverse/2` and `:ets.select_reverse/1`.
+
+  When given a match spec, fans out across every shard (in reverse shard
+  order) and concatenates results. When given a continuation token from
+  `select_reverse/3`, resumes the in-memory paginated walk.
+  """
   @spec select_reverse(atom(), :ets.match_spec() | continuation()) ::
           [term()] | {[term()], continuation()} | :"$end_of_table"
   def select_reverse(table, continuation) when is_continuation(continuation) do
@@ -826,30 +787,36 @@ defmodule PartitionedEts do
 
   def select_reverse(table, spec), do: all_call(table, :select_reverse, [table, spec], :reverse)
 
+  @doc "See `:ets.select_reverse/3`. Same in-memory pagination approach as `match/3`."
   @spec select_reverse(atom(), :ets.match_spec(), pos_integer()) ::
           {[term()], continuation()} | :"$end_of_table"
   def select_reverse(table, spec, limit) do
     start_paginated(table, :select_reverse, spec, limit, :reverse)
   end
 
+  @doc "See `:ets.update_counter/3`. Single-shard call, routes via HRW."
   @spec update_counter(atom(), term(), term()) :: integer()
   def update_counter(table, key, update_op) do
     partitioned_call(table, key, :update_counter, [table, key, update_op])
   end
 
+  @doc "See `:ets.update_counter/4`. Single-shard call, routes via HRW."
   @spec update_counter(atom(), term(), term(), tuple()) :: integer()
   def update_counter(table, key, update_op, default) do
     partitioned_call(table, key, :update_counter, [table, key, update_op, default])
   end
 
+  @doc "See `:ets.update_element/3`. Single-shard call, routes via HRW."
   @spec update_element(atom(), term(), {pos_integer(), term()}) :: boolean()
   def update_element(table, key, update_op) do
     partitioned_call(table, key, :update_element, [table, key, update_op])
   end
 
+  @doc "See `:ets.take/2`. Single-shard call, routes via HRW."
   @spec take(atom(), term()) :: [tuple()]
   def take(table, key), do: partitioned_call(table, key, :take, [table, key])
 
+  @doc "See `:ets.select_replace/2`. Fans out across every shard in the cluster."
   @spec select_replace(atom(), :ets.match_spec()) :: non_neg_integer()
   def select_replace(table, spec), do: all_call(table, :select_replace, [table, spec])
 
@@ -873,18 +840,44 @@ defmodule PartitionedEts do
   # ── Routing helpers ──────────────────────────────────────────────────
 
   defp config(table) do
-    :persistent_term.get({__MODULE__, table, :config})
+    :persistent_term.get({__MODULE__, table, :config}, nil) ||
+      raise ArgumentError, "#{inspect(table)} is not running on this node"
   end
 
   defp partitioned_call(table, key, fun, args) do
     {key_node, partition_table} = key_shard(table, key)
 
     if key_node == node() do
-      apply(:ets, fun, [partition_table | tl(args)])
+      try do
+        result = apply(:ets, fun, [partition_table | tl(args)])
+        maybe_record_clock(table, key, fun)
+        result
+      rescue
+        _e in ArgumentError ->
+          reraise ArgumentError, "#{inspect(table)} is not running on this node", __STACKTRACE__
+      end
     else
       :erpc.call(key_node, __MODULE__, :__remote_dispatch__, [partition_table, fun, args])
     end
   end
+
+  # Only record writes (not reads) in clock mode. Clock mode is active
+  # when the shadow table exists (created at handoff start, destroyed
+  # at handoff end). :ets.whereis is O(1).
+  @write_fns [:insert, :insert_new, :delete, :delete_object, :update_counter, :update_element]
+
+  defp maybe_record_clock(table, key, fun) when fun in @write_fns do
+    cfg = :persistent_term.get({__MODULE__, table, :config}, nil)
+
+    if cfg do
+      case :ets.whereis(cfg.shadow_name) do
+        :undefined -> :ok
+        shadow -> Handoff.record_write(shadow, cfg.clock_ref, key)
+      end
+    end
+  end
+
+  defp maybe_record_clock(_table, _key, _fun), do: :ok
 
   defp all_call(table, fun, args, direction \\ :forward) do
     nodes = fetch_nodes(table, direction)
@@ -927,27 +920,32 @@ defmodule PartitionedEts do
 
   defp key_shard(table, key) do
     cfg = config(table)
-    shards = shards(table, :forward)
-    cfg.hash.hash(key, shards)
+
+    case shards(table, :forward) do
+      [] -> raise ArgumentError, "#{inspect(table)} is not running on this node"
+      shards -> cfg.hash.hash(key, shards)
+    end
   end
 
+  # Returns a sorted list of unique nodes hosting this table, excluding
+  # the local node if its tables no longer exist (brief window between
+  # GenServer exit and PgRegistry processing the EXIT).
   defp fetch_nodes(table) do
-    # Exclude the local node when its named ETS tables no longer exist.
-    # There is a brief window between the local owner GenServer exiting
-    # (which destroys all of its named partition ETS tables) and `:pg`
-    # processing the resulting process EXIT and removing the dead pid
-    # from the group. During that window, `Registry.members/1` still
-    # returns the dead local pid, and routing to the local node would
-    # fail with `:badarg` because the named tables are gone.
-    local_node = node()
-    local_present? = local_present?(table)
+    cfg = config(table)
 
-    table
-    |> Registry.members()
-    |> Enum.map(&:erlang.node/1)
-    |> Enum.uniq()
-    |> Enum.reject(fn n -> n == local_node and not local_present? end)
-    |> Enum.sort()
+    if cfg.distributed do
+      local_node = node()
+      local_present? = local_present?(table)
+
+      table
+      |> Registry.members()
+      |> Enum.map(fn {pid, _meta} -> :erlang.node(pid) end)
+      |> Enum.uniq()
+      |> Enum.reject(fn n -> n == local_node and not local_present? end)
+      |> Enum.sort()
+    else
+      [node()]
+    end
   end
 
   defp local_present?(table) do
@@ -969,16 +967,61 @@ defmodule PartitionedEts do
   #
   # A "shard" is a {node, partition_table} pair. Iterating shards is
   # what powers fan-out reads, paginated scans, find/fold, and
-  # next/prev. The shard order is nodes-major (sorted), partitions-
-  # minor (in their stored order). Phase 3 assumes a homogeneous
-  # partition layout across the cluster — each node has the same
-  # `:partitions` count and therefore the same partition table names.
+  # next/prev. Each node's partition tables are read from PgRegistry
+  # metadata, supporting heterogeneous partition counts.
 
   defp shards(table, direction) do
-    nodes = fetch_nodes(table, direction)
-    pts = config(table).partition_tables |> Tuple.to_list() |> maybe_reverse(direction)
+    cfg = config(table)
 
-    for n <- nodes, pt <- pts, do: {n, pt}
+    shards =
+      if cfg.distributed do
+        distributed_shards(table, cfg)
+      else
+        local_shards(cfg)
+      end
+
+    maybe_reverse(shards, direction)
+  end
+
+  defp local_shards(cfg) do
+    pts = Tuple.to_list(cfg.partition_tables)
+    for pt <- pts, do: {node(), pt}
+  end
+
+  defp distributed_shards(table, _cfg) do
+    local_node = node()
+    local_present? = local_present?(table)
+
+    members =
+      table
+      |> Registry.members()
+      |> Enum.reject(fn {pid, _meta} ->
+        :erlang.node(pid) == local_node and not local_present?
+      end)
+
+    members
+    |> Enum.flat_map(fn {pid, meta} ->
+      n = :erlang.node(pid)
+      pts = partition_tables_for(meta, table, n)
+      for pt <- pts, do: {n, pt}
+    end)
+    |> Enum.uniq()
+    |> Enum.sort()
+  end
+
+  # Extract partition tables from PgRegistry metadata. Falls back to
+  # local config when metadata is nil (e.g. during init before
+  # update_value has been called).
+  defp partition_tables_for(%{partition_tables: pts}, _table, _node) when is_list(pts), do: pts
+
+  defp partition_tables_for(_meta, table, node) do
+    if node == node() do
+      Tuple.to_list(config(table).partition_tables)
+    else
+      # Remote node hasn't published metadata yet — fall back to
+      # local config (homogeneous assumption as a safe default).
+      Tuple.to_list(config(table).partition_tables)
+    end
   end
 
   defp maybe_reverse(list, :forward), do: list
@@ -1037,23 +1080,13 @@ defmodule PartitionedEts do
 
   # ── Paginated scans (match/3, select/3, …) ───────────────────────────
   #
-  # Phase 3 limitation: rather than streaming chunks via `:ets`
-  # continuations across nodes (which doesn't actually work — the
-  # internal magic refs in an `:ets` continuation point to compiled
-  # match-spec resources that are local to the originating VM and
-  # round-trip incorrectly via :erpc), we materialize the full result
-  # set on the first call by fanning out unbounded across all shards,
-  # then paginate the in-memory list.
+  # Currently materializes the full cluster-wide result set on the
+  # first call, then paginates the in-memory list. The continuation
+  # tuple is opaque: {:continue, fun, spec, limit, leftover}.
   #
-  # The continuation tuple shape is opaque to callers but holds:
-  #
-  #   {:continue, fun, spec, limit, leftover}
-  #
-  # where `leftover` is the unread tail of the materialized result
-  # list. This is wasteful for large tables — Phase 4/5 will introduce
-  # per-node scan-session processes that hold the `:ets` continuation
-  # locally and stream chunks back, sidestepping the cross-node refs
-  # problem.
+  # ETS continuations do survive distribution (verified by cross-node
+  # tests), so a future improvement can stream chunks directly using
+  # :ets continuations over :erpc without full materialization.
 
   defp start_paginated(table, fun, spec, limit, direction) do
     full_args =
@@ -1094,19 +1127,22 @@ defmodule PartitionedEts do
   defmacro __using__(opts) do
     table_opts = Keyword.fetch!(opts, :table_opts)
     partitions = Keyword.get(opts, :partitions, 1)
+    distributed = Keyword.get(opts, :distributed, true)
 
     quote location: :keep do
       @behaviour PartitionedEts
 
       @partitioned_ets_table_opts unquote(table_opts)
       @partitioned_ets_partitions unquote(partitions)
+      @partitioned_ets_distributed unquote(distributed)
 
       def child_spec(_opts) do
         PartitionedEts.child_spec(
           name: __MODULE__,
           table_opts: @partitioned_ets_table_opts,
           partitions: @partitioned_ets_partitions,
-          callbacks: __MODULE__
+          callbacks: __MODULE__,
+          distributed: @partitioned_ets_distributed
         )
       end
 
@@ -1115,7 +1151,8 @@ defmodule PartitionedEts do
           name: __MODULE__,
           table_opts: @partitioned_ets_table_opts,
           partitions: @partitioned_ets_partitions,
-          callbacks: __MODULE__
+          callbacks: __MODULE__,
+          distributed: @partitioned_ets_distributed
         )
       end
 

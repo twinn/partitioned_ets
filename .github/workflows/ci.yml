@@ -8,12 +8,18 @@ on:
 
 jobs:
   test:
+    name: Test (Elixir ${{ matrix.elixir }} / OTP ${{ matrix.otp }})
     runs-on: ubuntu-latest
 
     strategy:
       matrix:
-        elixir: ["1.19"]
-        otp: ["28"]
+        include:
+          - elixir: "1.15"
+            otp: "26"
+          - elixir: "1.17"
+            otp: "27"
+          - elixir: "1.19"
+            otp: "28"
 
     steps:
       - uses: actions/checkout@v4
@@ -31,11 +37,18 @@ jobs:
           key: ${{ runner.os }}-mix-${{ matrix.elixir }}-${{ matrix.otp }}-${{ hashFiles('mix.lock') }}
           restore-keys: ${{ runner.os }}-mix-${{ matrix.elixir }}-${{ matrix.otp }}-
 
+      - uses: actions/cache@v4
+        with:
+          path: priv/plts
+          key: ${{ runner.os }}-plt-${{ matrix.elixir }}-${{ matrix.otp }}-${{ hashFiles('mix.lock') }}
+          restore-keys: ${{ runner.os }}-plt-${{ matrix.elixir }}-${{ matrix.otp }}-
+
       - run: mix deps.get
-      - run: mix format --check-formatted
       - run: mix compile --warnings-as-errors
-      # The :peer-based test cluster needs epmd running so spawned nodes
-      # can register over the inet_tcp protocol.
+      - run: mix format --check-formatted
+      - run: mix credo --strict
       - run: epmd -daemon
-      - run: mix ci
-      - run: mix dialyzer
+      - run: mix test
+        env:
+          ERL_FLAGS: "-kernel prevent_overlapping_partitions false"
+      - run: MIX_ENV=dev mix dialyzer

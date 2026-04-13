@@ -55,7 +55,9 @@ defmodule PartitionedEts.Cluster do
   end
 
   defp inet_loader_args do
-    to_charlist("-loader inet -hosts 127.0.0.1 -setcookie #{:erlang.get_cookie()}")
+    to_charlist(
+      "-loader inet -hosts 127.0.0.1 -setcookie #{:erlang.get_cookie()} -kernel prevent_overlapping_partitions false"
+    )
   end
 
   defp allow_boot(host) do
@@ -75,11 +77,14 @@ defmodule PartitionedEts.Cluster do
     end
   end
 
+  @skip_apps [:dialyxir, :credo, :styler]
+
   defp ensure_applications_started(node) do
     rpc(node, Application, :ensure_all_started, [:mix])
     rpc(node, Mix, :env, [Mix.env()])
 
-    for {app_name, _, _} <- Application.loaded_applications() do
+    for {app_name, _, _} <- Application.loaded_applications(),
+        app_name not in @skip_apps do
       rpc(node, Application, :ensure_all_started, [app_name])
     end
   end

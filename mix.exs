@@ -8,13 +8,14 @@ defmodule PartitionedEts.MixProject do
     [
       app: :partitioned_ets,
       version: @version,
-      elixir: "~> 1.19",
+      elixir: "~> 1.15",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       aliases: aliases(),
       description: description(),
       package: package(),
+      docs: docs(),
       source_url: @source_url,
       dialyzer: [plt_add_apps: [:ex_unit]]
     ]
@@ -44,6 +45,15 @@ defmodule PartitionedEts.MixProject do
     ]
   end
 
+  defp docs do
+    [
+      main: "PartitionedEts",
+      source_ref: "v#{@version}",
+      source_url: @source_url,
+      extras: ["README.md", "CHANGELOG.md"]
+    ]
+  end
+
   defp aliases do
     [
       ci: ["format --check-formatted", "credo --strict", "test"],
@@ -56,9 +66,11 @@ defmodule PartitionedEts.MixProject do
 
   defp deps do
     [
+      {:pg_registry, "~> 0.4.1"},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:styler, "~> 1.11", only: [:dev, :test], runtime: false},
-      {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false}
+      {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
+      {:ex_doc, "~> 0.35", only: :dev, runtime: false}
     ]
   end
 end
